@@ -1,13 +1,15 @@
 <script setup>
-import { GetStockEastMoneyKLine, GetStockEastMoneyKLinePage, GetStockKLineWithFallback, GetStockKLinePageWithFallback } from '../../wailsjs/go/main/App'
+import { GetStockEastMoneyKLine, GetStockEastMoneyKLinePage, GetStockKLineWithFallback, GetStockKLinePageWithFallback, Follow, UnFollow, GetFollowList, GetGroupList, AddStockGroup, AddGroup } from '../../wailsjs/go/main/App'
+import { EventsEmit } from '../../wailsjs/runtime'
 import {
   CandlestickSeries,
   createChart,
   HistogramSeries,
   LineSeries,
   LineStyle,
+  MismatchDirection,
 } from 'lightweight-charts'
-import { NButton, NFlex, NInput, NSpin, NText, NTooltip } from 'naive-ui'
+import { NButton, NDropdown, NFlex, NInput, NModal, NText, NTooltip, useMessage } from 'naive-ui'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   smaValues, emaFinite, emaLeadingNull, weightedMaValues, bollingerBands, obvValues,
@@ -17,11 +19,26 @@ import {
   cmfValues, aroonValues, cmoValues, forceIndexValues, pivotPointsValues, demaValues,
   zigzagValues, satsValues, alligatorValues, aoValues, hullMaValues, adValues,
   trixValues, rocValues, fractalValues, chopValues, elderRayValues, chaikinOscValues,
-  vwapBandsValues, massIndexValues, ulcerIndexValues, coppockValues, temaValues, smiValues,
-  smcValues,
+  vwapBandsValues, massIndexValues, ulcerIndexValues, coppockValues, temaValues, smiValues, smcValues,
+  trixSlopeValues, temaSlopeValues, temaSlopeBundle,
+  tdSequentialValues, bbiValues, limitPriceLines, weisWaveValues, divergenceValues, limitBandEvidence,
+  buySellPointsValues, temaTurnPointsValues,
 } from './kline/calc'
 import { makeToggle } from './kline/indicators/toggle'
 import { parseNumStr, formatPrice2, formatVolumeCn, formatAmountCn, formatPctField, formatSigned2 } from './kline/format'
+import { createMeasurePrimitive } from './kline/measurePrimitive'
+import { createWavePrimitive } from './kline/wavePrimitive'
+import { createVolumeProfilePrimitive, POC_COLOR } from './kline/volumeProfilePrimitive'
+import { createTDSequentialPrimitive } from './kline/tdSequentialPrimitive'
+import { createDivergencePrimitive } from './kline/divergencePrimitive'
+import { createBuySellPrimitive } from './kline/buySellPrimitive'
+import { createTemaTurnPrimitive } from './kline/temaTurnPrimitive'
+import { createMassZonePrimitive, massAdaptiveThresholds } from './kline/massZonePrimitive'
+import { createDrawingHost, DRAWING_TOOLS } from './kline/drawingManagerHost'
+import { extractOHLCV } from './kline/bars'
+import {
+  alertAudioState, primeAlertAudio, playBuySellAlertTone, playTemaConfirmAlertTone, claimAlertToneOnce,
+} from './kline/alertSound'
 import {
   eastMoneyDayToUnixSeconds, eastMoneyKlineFieldToUnixSeconds, chartTimeToUtcMs,
   formatTickTime, sortKey, toChartTime, mergeKlineRows, mergeRefreshWithLatest,
@@ -32,6 +49,7 @@ import {
   CLR_RISE, CLR_FALL, DAILY_LIKE_KLT, CN_TZ,
   HISTORY_PAGE_SIZE, BARS_BEFORE_LOAD_MORE, DEFAULT_VISIBLE_BARS,
   DEFAULT_RIGHT_LOGICAL_GAP, SHOW_CHIP_TOOLBAR_BUTTON, INTERVALS,
+  ADJUST_OPTIONS, DEFAULT_ADJUST, BUY_SELL_SCORE_OPTIONS,
 } from './kline/constants'
 
 const props = defineProps({
@@ -63,6 +81,194 @@ const hoverRawRow = ref(null)
 /** 无十字线时展示：当前数据中时间最新的一根 K 线 */
 const defaultLatestRawRow = ref(null)
 const activeKlt = ref('101')
+// 场内 ETF 识别：沪市前缀 50/51/52/53/56/58，深市前缀 15/16；ETF 默认不复权且隐藏复权切换
+const isEtfCode = computed(() => {
+  const digits = String(props.code || '').replace(/[^\d]/g, '')
+  if (digits.length < 6) return false
+  const prefix = digits.substring(0, 2)
+  return ['15', '16', '50', '51', '52', '53', '56', '58'].includes(prefix)
+})
+// 港股识别：.HK 后缀或 HK 前缀；港股默认不复权（与项目约定一致），保留复权切换按钮
+const isHkCode = computed(() => {
+  const c = String(props.code || '').toUpperCase()
+  return c.endsWith('.HK') || c.startsWith('HK')
+})
+// 中证指数识别：.CSI 后缀（如 930599.CSI 中证高端装备制造）；走通达信扩展行情 ExKLine2 + category=62，
+// 协议不支持复权参数；默认不复权（与港股一致），保留复权切换按钮（东财降级源支持复权参数）
+const isCsiIndexCode = computed(() => {
+  const c = String(props.code || '').toUpperCase()
+  return c.endsWith('.CSI')
+})
+// 海外指数识别：100. 前缀（如 100.DJIA 道琼斯/100.SPX 标普500/100.NDX 纳斯达克/100.HSI 恒生）；
+// 走东方财富（secid=100.XXX），指数无复权概念，默认不复权
+const isGlobalIndexCode = computed(() => {
+  const c = String(props.code || '').toUpperCase()
+  if (!c.startsWith('100.')) return false
+  const suffix = c.slice(4)
+  if (!suffix) return false
+  // 海外指数代码为字母（DJIA/SPX/NDX/HSI），排除纯数字后缀
+  return !/[0-9]/.test(suffix)
+})
+// 币安 USDT-M 永续合约识别：bn: 前缀（如 bn:BTCUSDT，后端统一小写 bn:btcusdt）；
+// 属加密合约独立行情体系，无 A 股复权/涨跌停概念
+const isBinanceCode = computed(() => String(props.code || '').toUpperCase().startsWith('BN:'))
+// Bitget 美股永续合约识别：bt: 前缀（如 bt:AAPLUSDT，后端统一小写 bt:aaplusdt）；
+// 同属合约独立行情体系，无 A 股复权/涨跌停概念
+const isBitgetCode = computed(() => String(props.code || '').toUpperCase().startsWith('BT:'))
+// OKX 合约/现货识别：ok: 前缀（如 ok:BTC-USDT-SWAP，后端 ResolveOKXInstId 归一）；
+// 同属加密独立行情体系，无 A 股复权/涨跌停概念
+const isOKXCode = computed(() => String(props.code || '').toUpperCase().startsWith('OK:'))
+// 复权类型：qfq=前复权(默认)、hfq=后复权、none=不复权；仅日K及更长周期有效；场内 ETF/港股/中证指数/海外指数/币安合约/美股永续/OKX 默认 none
+const activeAdjust = ref((isEtfCode.value || isHkCode.value || isCsiIndexCode.value || isGlobalIndexCode.value || isBinanceCode.value || isBitgetCode.value || isOKXCode.value) ? 'none' : DEFAULT_ADJUST)
+// 实际传给后端的复权标识：分时周期传空串（走各数据源默认行为），日K类周期传 activeAdjust；币安合约/美股永续/OKX 恒为 none
+const adjustFlagForRequest = computed(() => {
+  if (isBinanceCode.value || isBitgetCode.value || isOKXCode.value) return 'none'
+  return DAILY_LIKE_KLT.has(activeKlt.value) ? activeAdjust.value : ''
+})
+
+// ===== 关注功能（参考 stock.vue） =====
+const message = useMessage()
+/** 当前股票是否已关注 */
+const isFollowed = ref(false)
+/** 关注操作进行中 */
+const followLoading = ref(false)
+/** 分组列表 */
+const followGroupList = ref([])
+/** 新建分组弹窗 */
+const addGroupShow = ref(false)
+const addGroupName = ref('')
+/** 新建分组后待关注的股票内部代码（null 表示非关注流程打开的弹窗） */
+const pendingFollowCode = ref(null)
+/** 关注下拉选项：默认（不分组）+ 各分组 + 新建分组 */
+const followGroupOptions = computed(() => {
+  const opts = [{ label: '默认（不分组）', key: 0 }]
+  followGroupList.value.forEach(g => opts.push({ label: g.name, key: g.ID }))
+  opts.push({ type: 'divider', key: 'divider' })
+  opts.push({ label: '新建分组', key: 'new' })
+  return opts
+})
+
+/** 东方财富格式代码转应用内部代码（如 000001.SZ → sh000001），与 stock.vue 一致 */
+function fromEastMoneyCode(emCode) {
+  if (!emCode) return ''
+  const c = String(emCode).trim().toUpperCase()
+  if (c.endsWith('.SH')) return 'sh' + c.slice(0, -3)
+  if (c.endsWith('.SZ')) return 'sz' + c.slice(0, -3)
+  if (c.endsWith('.BJ')) return 'bj' + c.slice(0, -3)
+  if (c.endsWith('.HK')) return 'hk' + c.slice(0, -3).toLowerCase()
+  if (c.endsWith('.US')) return 'us' + c.slice(0, -3).toLowerCase()
+  return c.toLowerCase()
+}
+
+/** 刷新当前股票的关注状态 */
+async function refreshFollowStatus() {
+  if (!props.code) {
+    isFollowed.value = false
+    return
+  }
+  const internalCode = fromEastMoneyCode(props.code)
+  try {
+    const [list, groups] = await Promise.all([GetFollowList(0), GetGroupList()])
+    followGroupList.value = groups || []
+    const followed = (list || []).some(item => {
+      // followList 中 StockCode 为内部格式（如 sh000001、gb_aapl）
+      if (item.StockCode === internalCode) return true
+      // 美股 gb_ 前缀兼容：usAAPL → gb_aapl
+      if (internalCode.startsWith('us') && item.StockCode === 'gb_' + internalCode.slice(2).toLowerCase()) return true
+      return false
+    })
+    isFollowed.value = followed
+  } catch (e) {
+    // 静默失败，不阻断 K 线图渲染
+    isFollowed.value = false
+  }
+}
+
+/** 下拉选择分组后关注；key='new' 时打开新建分组弹窗 */
+function handleFollowSelect(key) {
+  if (key === 'new') {
+    if (!props.code) {
+      message.error('请输入有效股票代码')
+      return
+    }
+    pendingFollowCode.value = fromEastMoneyCode(props.code)
+    addGroupName.value = ''
+    addGroupShow.value = true
+    return
+  }
+  doFollowStock(Number(key))
+}
+
+/** 新建分组并关注当前股票 */
+function saveAddGroup() {
+  const name = addGroupName.value.trim()
+  if (!name) {
+    message.warning('请输入分组名称')
+    return
+  }
+  AddGroup({ name, sort: 1 }).then(result => {
+    message.info(result)
+    addGroupShow.value = false
+    GetGroupList().then(gList => {
+      followGroupList.value = gList || []
+      EventsEmit('groupListChanged')
+      // 创建成功后执行关注+加分组
+      if (pendingFollowCode.value) {
+        const created = (gList || []).find(g => g.name === name)
+        pendingFollowCode.value = null
+        if (created) {
+          doFollowStock(created.ID)
+        }
+      }
+    })
+  }).catch(err => message.error('新建分组失败: ' + (err?.message || err)))
+}
+
+/** 关注并加入分组（groupId=0 表示不分组） */
+function doFollowStock(groupId) {
+  if (!props.code) {
+    message.error('请输入有效股票代码')
+    return
+  }
+  if (followLoading.value) return
+  followLoading.value = true
+  const internalCode = fromEastMoneyCode(props.code)
+  Follow(internalCode).then(result => {
+    if (result === '关注成功') {
+      isFollowed.value = true
+      const groupName = followGroupList.value.find(g => g.ID === groupId)?.name || ''
+      message.success(groupId > 0 ? `已关注，并加入分组「${groupName}」` : '关注成功')
+      // 加入分组
+      if (groupId > 0) {
+        // Follow 后美股 code 被归一化为 gb_ 格式，AddStockGroup 需用同格式
+        let groupCode = internalCode
+        if (internalCode.startsWith('us')) {
+          groupCode = 'gb_' + internalCode.slice(2).toLowerCase()
+        }
+        AddStockGroup(groupId, groupCode).then(() => {
+          GetGroupList().then(gList => { followGroupList.value = gList || [] })
+        }).catch(err => message.error('加入分组失败: ' + (err?.message || err)))
+      }
+    } else {
+      message.error(result)
+    }
+  }).catch(err => message.error('关注失败: ' + (err?.message || err))).finally(() => {
+    followLoading.value = false
+  })
+}
+
+/** 取消关注 */
+function unfollowStock() {
+  if (!props.code || followLoading.value) return
+  followLoading.value = true
+  const internalCode = fromEastMoneyCode(props.code)
+  UnFollow(internalCode).then(result => {
+    message.success(result)
+    isFollowed.value = false
+  }).catch(err => message.error('取消关注失败: ' + (err?.message || err))).finally(() => {
+    followLoading.value = false
+  })
+}
 const showMA = ref(false)
 const showBOLL = ref(false)
 const showOBV = ref(false)
@@ -98,6 +304,7 @@ const showAO = ref(false)
 const showHullMA = ref(false)
 const showAD = ref(false)
 const showTRIX = ref(false)
+const showTRIXSlope = ref(false)
 const showROC = ref(false)
 const showFractal = ref(false)
 const showCHOP = ref(false)
@@ -108,15 +315,211 @@ const showMassIndex = ref(false)
 const showUlcerIndex = ref(false)
 const showCoppock = ref(false)
 const showTEMA = ref(false)
+const showTEMASlope = ref(false)
 const showSMI = ref(false)
+const showSignalRatio = ref(false)
 const showSMC = ref(false)
 const showChip = ref(false)
+const showVolumeProfile = ref(false)
+/** 神奇九转 TD Sequential 数字标记（primitive） */
+const showTDSequential = ref(false)
+/** BBI 多空指标（主图叠加线） */
+const showBBI = ref(false)
+/** 涨跌停价位线（昨收锚定 price line） */
+const showLimitLines = ref(false)
+/** 自动背离（主图连线 primitive + 指标源选择） */
+const showDivergence = ref(false)
+/** 背离检测的指标源：'rsi' | 'macd' | 'kdj'（默认 RSI，经典 A 股教材口径） */
+const divergenceSource = ref('rsi')
+/** Weis Wave 威斯波浪（副图 histogram） */
+const showWeisWave = ref(false)
+/** 「买卖点预测」主图箭头标注（多指标共振） */
+const showBuySell = ref(false)
+/** 出现新的买卖点时播放提示音（默认开；仅「买卖点」开启时生效） */
+const buySellAlertSound = ref(true)
+/** 买卖点共振阈值：4=灵敏 6=标准 7=严格（等权计数制：命中的信号路数需 >= 该值，满分 14） */
+const buySellMinScore = ref(6)
+const buySellScoreLabel = computed(
+  () => BUY_SELL_SCORE_OPTIONS.find(o => o.value === buySellMinScore.value)?.label || '标准',
+)
+/** 「TEMA 斜率转折」独立买卖点标注（预警/确认双阶段，与 14 路共振体系互不影响） */
+const showTemaTurn = ref(false)
+/** 出现新的「T确」（TEMA 温和确认）时播放提示音（默认开；仅 TEMA 转折 开启时生效） */
+const temaTurnAlertSound = ref(true)
+
+// ===== 技术指标设置持久化（保存上次选择，避免每次进入重新选） =====
+const PERSIST_KEY = 'kline-indicator-settings'
+const PERSISTED_INDICATOR_REFS = [
+  showMA, showBOLL, showOBV, showMACD, showKDJ, showRSI, showATR, showVWAP,
+  showMFI, showKAMA, showKeltner, showSupertrend, showEMA, showIchimoku,
+  showCCI, showTTMSqueeze, showSAR, showDonchian, showADX, showWilliamsR,
+  showStochRSI, showCMF, showAroon, showCMO, showForceIndex, showPivot,
+  showDEMA, showZigZag, showSATS, showAvgAmp, showAlligator, showAO,
+  showHullMA, showAD, showTRIX, showTRIXSlope, showROC, showFractal,
+  showCHOP, showElderRay, showChaikinOsc, showVWAPBands, showMassIndex,
+  showUlcerIndex, showCoppock, showTEMA, showTEMASlope, showSMI, showSignalRatio, showSMC,
+  showChip, showVolumeProfile, showTDSequential, showBBI, showLimitLines,
+  showDivergence, showWeisWave, showBuySell, showTemaTurn, buySellAlertSound, temaTurnAlertSound,
+]
+const PERSISTED_INDICATOR_KEYS = [
+  'showMA', 'showBOLL', 'showOBV', 'showMACD', 'showKDJ', 'showRSI', 'showATR', 'showVWAP',
+  'showMFI', 'showKAMA', 'showKeltner', 'showSupertrend', 'showEMA', 'showIchimoku',
+  'showCCI', 'showTTMSqueeze', 'showSAR', 'showDonchian', 'showADX', 'showWilliamsR',
+  'showStochRSI', 'showCMF', 'showAroon', 'showCMO', 'showForceIndex', 'showPivot',
+  'showDEMA', 'showZigZag', 'showSATS', 'showAvgAmp', 'showAlligator', 'showAO',
+  'showHullMA', 'showAD', 'showTRIX', 'showTRIXSlope', 'showROC', 'showFractal',
+  'showCHOP', 'showElderRay', 'showChaikinOsc', 'showVWAPBands', 'showMassIndex',
+  'showUlcerIndex', 'showCoppock', 'showTEMA', 'showTEMASlope', 'showSMI', 'showSignalRatio', 'showSMC',
+  'showChip', 'showVolumeProfile', 'showTDSequential', 'showBBI', 'showLimitLines',
+  'showDivergence', 'showWeisWave', 'showBuySell', 'showTemaTurn', 'buySellAlertSound', 'temaTurnAlertSound',
+]
+const PERSISTED_KLT_SET = new Set(INTERVALS.map(it => it.klt))
+
+function loadIndicatorSettings() {
+  try {
+    const raw = localStorage.getItem(PERSIST_KEY)
+    if (!raw) return
+    const data = JSON.parse(raw) || {}
+    PERSISTED_INDICATOR_KEYS.forEach((key, i) => {
+      if (typeof data[key] === 'boolean') PERSISTED_INDICATOR_REFS[i].value = data[key]
+    })
+    // activeKlt 校验合法值，避免脏数据导致周期异常
+    if (typeof data.activeKlt === 'string' && PERSISTED_KLT_SET.has(data.activeKlt)) {
+      activeKlt.value = data.activeKlt
+    }
+    // 背离指标源（rsi/macd/kdj）
+    if (typeof data.divergenceSource === 'string' && ['rsi', 'macd', 'kdj'].includes(data.divergenceSource)) {
+      divergenceSource.value = data.divergenceSource
+    }
+    // 买卖点共振阈值（14 路等权制 4/6/7）；旧档值不在新档位时落默认「标准 6」——
+    // 旧加权制 2/3/4 一次性 +1 迁移（2→3、3→4、4→5）；旧 9/10 路 3/5 落默认、4 语义由「标准」变「灵敏」
+    if (BUY_SELL_SCORE_OPTIONS.some(o => o.value === data.buySellMinScore)) {
+      buySellMinScore.value = data.buySellMinScore
+    } else if (data.buySellEqw !== true && [2, 3, 4].includes(data.buySellMinScore)) {
+      const migrated = data.buySellMinScore + 1
+      if (BUY_SELL_SCORE_OPTIONS.some(o => o.value === migrated)) buySellMinScore.value = migrated
+    }
+  } catch {}
+}
+
+let persistTimer = null
+function persistIndicatorSettings() {
+  if (persistTimer) clearTimeout(persistTimer)
+  persistTimer = setTimeout(() => {
+    persistTimer = null
+    try {
+      const data = { activeKlt: activeKlt.value, divergenceSource: divergenceSource.value, buySellMinScore: buySellMinScore.value, buySellEqw: true }
+      PERSISTED_INDICATOR_KEYS.forEach((key, i) => {
+        data[key] = PERSISTED_INDICATOR_REFS[i].value
+      })
+      localStorage.setItem(PERSIST_KEY, JSON.stringify(data))
+    } catch {}
+  }, 200)
+}
+
+// setup 阶段加载上次设置（在 onMounted/loadData 之前，syncIndicators 会按这些值渲染）
+loadIndicatorSettings()
+
+// 任一指标开关或周期变化时防抖保存
+watch(
+  [...PERSISTED_INDICATOR_REFS, activeKlt, divergenceSource, buySellMinScore],
+  () => persistIndicatorSettings(),
+)
+
 const chipBins = ref(80)
 const chipCanvasRef = ref(null)
 const chipItems = ref([])
 const chipMeta = ref({ avgCost: 0, profitRatio: 0, current: 0, hoverDate: '', minPrice: 0, maxPrice: 0 })
 /** TradingView 风格「多单」：开仓 / 止损 / 止盈 价位线 */
 const showLongPosition = ref(false)
+/** 「测量」画框模式：两点画矩形，显示涨跌幅/价差/K线数/成交量（支持多框） */
+const showMeasure = ref(false)
+/** 当前正在画的框起点 { time:number, price:number } | null */
+const measureP1 = ref(null)
+/** 已完成的测量框列表 [{p1, p2, stats}] */
+const measureShapes = ref([])
+/** 测量 primitive 实例（对象引用稳定，无需响应式） */
+let measurePrimitive = null
+/** ESC 键监听句柄 */
+let measureKeydownHandler = null
+/** 「波浪」绘图模式：两点选区，自动计算 5 浪 + 斐波那契回调 + 通道 + 浪号 */
+const showWave = ref(false)
+/** 当前正在画的波浪起点 { time:number, price:number } | null */
+const waveP0 = ref(null)
+/** 已完成的波浪列表 [{p0, p5}]（仅存端点） */
+const waveShapes = ref([])
+/** 波浪 primitive 实例（对象引用稳定，无需响应式） */
+let wavePrimitive = null
+/** 「成交量分布」primitive 实例（仿 TradingView VPVR，随可见区间自动重算） */
+let volumeProfilePrimitive = null
+/** VPVR 用的 OHLCV 缓存（按 mergedRawRowsVersion 失效，避免每帧重排序） */
+const volumeProfileBarsCache = { version: -1, data: null }
+/** POC 数值标签（挂在价格刻度上；横向虚线仍由 primitive 画，这里只取轴上的 tag） */
+let pocPriceLineHandle = null
+let pocTagRaf = 0
+/** 「神奇九转」primitive 实例（数字标记叠加层） */
+let tdSequentialPrimitive = null
+/** 「Mass Index 反转窗口」primitive 实例（主图半透明竖带） */
+let massZonePrimitive = null
+/** Mass 反转窗口数据缓存（按 mergedRawRowsVersion 失效） */
+const massZoneCache = { version: -1, data: null }
+/** 九转计数缓存（按 mergedRawRowsVersion 失效） */
+const tdSequentialCache = { version: -1, counts: null }
+/** 九转用的 OHLCV 缓存（复用 VPVR 缓存格式） */
+const tdSequentialBarsCache = { version: -1, data: null }
+/** BBI 主图叠加线 series 实例 */
+let bbiSeries = null
+/** 涨跌停价位线句柄（createPriceLine 返回，需 remove） */
+let limitPriceLineHandles = []
+/** 「自动背离」primitive 实例（主图连线+徽章） */
+let divergencePrimitive = null
+/** 背离检测结果缓存（按 mergedRawRowsVersion + source 失效） */
+const divergenceCache = { version: -1, source: '', data: null }
+/** 背离用的 OHLCV 缓存（含指标源所需字段） */
+const divergenceBarsCache = { version: -1, data: null }
+/** 「买卖点预测」primitive 实例（主图箭头标注） */
+let buySellPrimitive = null
+/** 买卖点检测结果缓存（按 mergedRawRowsVersion + 档位 + 周期失效） */
+const buySellCache = { version: -1, score: -1, klt: '', data: null }
+/** 买卖点用的 OHLCV 缓存 */
+const buySellBarsCache = { version: -1, data: null }
+/**
+ * 买卖点提示音基线：记录已提示过的最新信号所在 K 线的时间（不是数组下标——向左加载更多
+ * 历史会把所有下标整体推后，用下标比较会误判为「新信号」而误报），只在出现时间更晚的
+ * 信号时响铃，避免每次轮询刷新/重绘都重复播报历史箭头。
+ * ctx 记录 (股票|周期|档位) 上下文，上下文变化时只重置基线不响铃（换股/切周期不算新信号）。
+ */
+const buySellAlertState = { ready: false, ctx: '', buy: null, sell: null }
+/** 「TEMA 斜率转折」primitive 实例（主图预警/确认标记，独立于买卖点体系） */
+let temaTurnPrimitive = null
+/** TEMA 转折点检测结果缓存（按 mergedRawRowsVersion + 周期失效） */
+const temaTurnCache = { version: -1, klt: '', data: null }
+/**
+ * 「T确」提示音基线：与买卖点提示音同理，以 K 线时间（非数组下标）记录最新确认点，
+ * 只在出现时间更晚的确认信号时响铃，避免轮询刷新/加载更早历史导致重复或误报。
+ */
+const temaTurnAlertState = { ready: false, ctx: '', buy: null, sell: null }
+/** 波浪 ESC 键监听句柄 */
+let waveKeydownHandler = null
+// 波浪点拖拽状态（复用 longDragWindowListeners 范式）
+let waveDragActive = false              // 是否正在拖拽某个波浪点
+let waveDragTarget = null               // {shapeIndex, pointIdx} 当前拖拽目标
+let waveDragListenersOn = false         // window pointermove/up 监听是否已挂
+let waveDragSuppressClick = false       // 拖拽结束时抑制尾随的 chart click
+let wavePanePointerDownHandler = null   // pane pointerdown 监听句柄
+let lastCrosshairPoint = null           // 缓存最近一次 crosshairMove 的 param.point，供 pointerdown hitTest 复用
+/** 波浪绘制模式选项：impulse5=完整5浪，predict3=3浪预测（选p0+p3预测p4p5） */
+const WAVE_MODE_OPTIONS = [
+  { value: 'impulse5', label: '5浪' },
+  { value: 'predict3', label: '3浪预测' },
+]
+/** 当前波浪绘制模式 */
+const waveMode = ref('impulse5')
+// 绘图插件（lightweight-charts-drawing）：与波浪/测量共存，manager 自带交互绘制
+let drawingHost = null                  // drawingManagerHost 实例
+const drawingActiveTool = ref(null)     // 当前激活工具 key（null=未激活）
+const drawingTotalCount = ref(0)        // 已完成 drawing 数（清空按钮 disabled 用）
+let drawingKeydownHandler = null        // 绘图 ESC/Ctrl+Z 监听句柄
 const longEntryStr = ref('')
 const longStopStr = ref('')
 const longTakeProfitStr = ref('')
@@ -133,12 +536,38 @@ const loadingHistory = ref(false)
 const errorText = ref('')
 const activeDataSource = ref('')
 
+// 左侧指标栏收起状态（记忆上次选择，避免每次进来重新收）
+const SIDEBAR_COLLAPSED_KEY = 'kline-sidebar-collapsed'
+const sidebarCollapsed = ref(false)
+
+/** 收起/展开左侧指标栏，把宽度让给 K 线 */
+function toggleSidebar() {
+  sidebarCollapsed.value = !sidebarCollapsed.value
+  try {
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, sidebarCollapsed.value ? '1' : '0')
+  } catch {}
+}
+
+/** 通达信MAC 数据源（本地行情服务器）的实时轮询间隔：比默认 60 秒更密，用于短线盯盘 */
+const MAC_POLL_INTERVAL_MS = 10000
+/** 永续合约（币安 bn: / Bitget bt: / OKX ok:）K 线轮询间隔：7×24 交易、波动快，固定 5 秒 */
+const CONTRACT_POLL_INTERVAL_MS = 5000
+/** 实际生效的轮询间隔：合约 5 秒，MAC 数据源 10 秒，其余沿用父组件传入值 */
+const pollIntervalMs = computed(() => {
+  if (isBinanceCode.value || isBitgetCode.value || isOKXCode.value) return CONTRACT_POLL_INTERVAL_MS
+  return activeDataSource.value === 'tdx-mac' ? MAC_POLL_INTERVAL_MS : props.realtimeIntervalMs
+})
+
 let chart = null
 let candleSeries = null
 let volSeries = null
 let pollTimer = null
+/** 轮询请求在途标记，避免高频轮询叠加请求 */
+let pollInFlight = false
 /** 已合并的后端原始 K 线（按时间升序） */
 let mergedRawRows = []
+/** 每次 mergedRawRows 变更后递增，供 computed 感知变化 */
+const mergedRawRowsVersion = ref(0)
 const hasMoreOlder = ref(true)
 let loadOlderDebounceTimer = null
 /** Wails/WebView 下可见区回调偶发不触发，用轻量轮询兜底 */
@@ -177,6 +606,7 @@ const ind = {
   ma10: null,
   ma20: null,
   ma60: null,
+  ma250: null,
   bollU: null,
   bollM: null,
   bollL: null,
@@ -243,6 +673,7 @@ const ind = {
   adLine: null,
   trixLine: null,
   trixSignal: null,
+  trixSlopeHist: null,
   rocLine: null,
   fractalHigh: null,
   fractalLow: null,
@@ -257,6 +688,7 @@ const ind = {
   ulcerLine: null,
   coppockLine: null,
   temaLine: null,
+  temaSlopeLine: null,
   smiLine: null,
   smiSignal: null,
   smcSwingHigh: null,
@@ -265,8 +697,8 @@ const ind = {
   smcIntLow: null,
   smcBos: null,
   smcChoch: null,
-  smcSwingBos: null,
-  smcSwingChoch: null,
+  smcSwBos: null,
+  smcSwChoch: null,
   smcFvgTop: null,
   smcFvgBot: null,
   smcObTop: null,
@@ -287,36 +719,6 @@ function removeSeriesSafe(api) {
 
 
 
-function extractOHLCV(rows) {
-  const sorted = [...(rows || [])].sort((a, b) => sortKey(a.day) - sortKey(b.day))
-  const times = []
-  const opens = []
-  const closes = []
-  const highs = []
-  const lows = []
-  const vols = []
-  const amplitudes = []
-  for (const r of sorted) {
-    const t = toChartTime(r.day)
-    if (t === null) continue
-    const o = Number(r.open)
-    const h = Number(r.high)
-    const l = Number(r.low)
-    const c = Number(r.close)
-    const v = Number(r.volume)
-    if (![o, h, l, c].every(Number.isFinite)) continue
-    times.push(t)
-    opens.push(o)
-    closes.push(c)
-    highs.push(h)
-    lows.push(l)
-    vols.push(Number.isFinite(v) ? v : 0)
-    const rawAmp = parseNumStr(r.amplitude)
-    amplitudes.push(Number.isFinite(rawAmp) ? rawAmp : (o > 0 ? (h - l) / o * 100 : NaN))
-  }
-  return { times, opens, closes, highs, lows, vols, amplitudes }
-}
-
 function avgAmplitude(amplitudes, period) {
   if (!amplitudes || amplitudes.length < period) return NaN
   let s = 0, cnt = 0
@@ -325,6 +727,12 @@ function avgAmplitude(amplitudes, period) {
     if (Number.isFinite(v)) { s += v; cnt++ }
   }
   return cnt === period ? s / cnt : NaN
+}
+
+function formatVolumeRatio(v) {
+  if (v == null || v === '' || v === '--') return '--'
+  const n = Number(v)
+  return Number.isFinite(n) ? n.toFixed(2) : '--'
 }
 
 function toLineData(times, values) {
@@ -423,6 +831,9 @@ function tearDownAllSubPanes() {
   ind.adLine = removeSeriesSafe(ind.adLine)
   ind.trixLine = removeSeriesSafe(ind.trixLine)
   ind.trixSignal = removeSeriesSafe(ind.trixSignal)
+  ind.trixSlopeHist = removeSeriesSafe(ind.trixSlopeHist)
+  ind.temaSlopeLine = removeSeriesSafe(ind.temaSlopeLine)
+  ind.temaSlopeHist = removeSeriesSafe(ind.temaSlopeHist)
   ind.rocLine = removeSeriesSafe(ind.rocLine)
   ind.chopLine = removeSeriesSafe(ind.chopLine)
   ind.elderBull = removeSeriesSafe(ind.elderBull)
@@ -433,6 +844,10 @@ function tearDownAllSubPanes() {
   ind.coppockLine = removeSeriesSafe(ind.coppockLine)
   ind.smiLine = removeSeriesSafe(ind.smiLine)
   ind.smiSignal = removeSeriesSafe(ind.smiSignal)
+  ind.signalRatioBullish = removeSeriesSafe(ind.signalRatioBullish)
+  ind.signalRatioBearish = removeSeriesSafe(ind.signalRatioBearish)
+  ind.signalRatioNet = removeSeriesSafe(ind.signalRatioNet)
+  ind.weisWave = removeSeriesSafe(ind.weisWave)
   while (chart.panes().length > 1) {
     chart.removePane(chart.panes().length - 1)
   }
@@ -469,6 +884,8 @@ function syncSubPaneIndicators(times, closes, highs, lows, vols) {
   if (showAO.value) subs.push('ao')
   if (showAD.value) subs.push('ad')
   if (showTRIX.value) subs.push('trix')
+  if (showTRIXSlope.value) subs.push('trixSlope')
+  if (showTEMASlope.value) subs.push('temaSlope')
   if (showROC.value) subs.push('roc')
   if (showCHOP.value) subs.push('chop')
   if (showElderRay.value) subs.push('elderRay')
@@ -477,6 +894,8 @@ function syncSubPaneIndicators(times, closes, highs, lows, vols) {
   if (showUlcerIndex.value) subs.push('ulcerIndex')
   if (showCoppock.value) subs.push('coppock')
   if (showSMI.value) subs.push('smi')
+  if (showSignalRatio.value) subs.push('signalRatio')
+  if (showWeisWave.value) subs.push('weisWave')
   if (subs.length === 0) return
 
   chart.panes()[0]?.setStretchFactor(3)
@@ -689,7 +1108,7 @@ function syncSubPaneIndicators(times, closes, highs, lows, vols) {
         LineSeries,
         {
           ...subLineOpts,
-          color: '#3b82f6',
+          color: '#d946ef',
           lineWidth: 2,
           title: 'ADX',
           priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
@@ -914,6 +1333,70 @@ function syncSubPaneIndicators(times, closes, highs, lows, vols) {
       )
       ind.trixLine.setData(toLineData(times, trix))
       ind.trixSignal.setData(toLineData(times, signal))
+    } else if (key === 'trixSlope') {
+      const slope = trixSlopeValues(closes, 15)
+      ind.trixSlopeHist = chart.addSeries(
+        HistogramSeries,
+        {
+          priceLineVisible: false,
+          lastValueVisible: false,
+          priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
+        },
+        paneIdx,
+      )
+      const slopeData = []
+      for (let i = 0; i < times.length; i++) {
+        const sv = slope[i]
+        if (sv != null && Number.isFinite(sv)) {
+          slopeData.push({
+            time: times[i],
+            value: sv,
+            color: sv >= 0
+              ? (i > 0 && slope[i - 1] != null && sv > slope[i - 1] ? 'rgba(239, 83, 80, 0.7)' : 'rgba(239, 83, 80, 0.35)')
+              : (i > 0 && slope[i - 1] != null && sv < slope[i - 1] ? 'rgba(38, 166, 154, 0.7)' : 'rgba(38, 166, 154, 0.35)'),
+          })
+        }
+      }
+      ind.trixSlopeHist.setData(slopeData)
+    } else if (key === 'temaSlope') {
+      // TEMA 斜率：柱状图=原始斜率(红正绿负)，曲线=EMA(5)平滑斜率(紫色)，共用价格刻度
+      const { raw, smoothed } = temaSlopeBundle(closes, 21, 5)
+      ind.temaSlopeHist = chart.addSeries(
+        HistogramSeries,
+        {
+          priceFormat: { type: 'price', precision: 3, minMove: 0.001 },
+          priceScaleId: 'temaSlope',
+        },
+        paneIdx,
+      )
+      ind.temaSlopeLine = chart.addSeries(
+        LineSeries,
+        {
+          ...subLineOpts,
+          color: '#a855f7',
+          lineWidth: 2,
+          title: 'TEMA斜率',
+          priceFormat: { type: 'price', precision: 3, minMove: 0.001 },
+          priceScaleId: 'temaSlope',
+          lastValueVisible: true,
+        },
+        paneIdx,
+      )
+      const histData = []
+      for (let i = 0; i < times.length; i++) {
+        const sv = raw[i]
+        if (sv != null && Number.isFinite(sv)) {
+          histData.push({
+            time: times[i],
+            value: sv,
+            color: sv >= 0
+              ? (i > 0 && raw[i - 1] != null && sv > raw[i - 1] ? 'rgba(239, 83, 80, 0.7)' : 'rgba(239, 83, 80, 0.35)')
+              : (i > 0 && raw[i - 1] != null && sv < raw[i - 1] ? 'rgba(38, 166, 154, 0.7)' : 'rgba(38, 166, 154, 0.35)'),
+          })
+        }
+      }
+      ind.temaSlopeHist.setData(histData)
+      ind.temaSlopeLine.setData(toLineData(times, smoothed))
     } else if (key === 'roc') {
       const roc = rocValues(closes, 12)
       ind.rocLine = chart.addSeries(
@@ -1069,6 +1552,260 @@ function syncSubPaneIndicators(times, closes, highs, lows, vols) {
       )
       ind.smiLine.setData(toLineData(times, smiData))
       ind.smiSignal.setData(toLineData(times, smiSig))
+    } else if (key === 'signalRatio') {
+      // 逐根 K 线评估所有指标信号，计算看多/看空/中性/震荡比例
+      const bullishArr = new Array(times.length).fill(null)
+      const bearishArr = new Array(times.length).fill(null)
+      const netArr = new Array(times.length).fill(null)
+      // 预计算所有指标数组（只算一次）
+      const ma5 = smaValues(closes, 5)
+      const ma10 = smaValues(closes, 10)
+      const ma20 = smaValues(closes, 20)
+      const ma60 = smaValues(closes, 60)
+      const ema12 = emaFinite(closes, 12)
+      const ema21 = emaFinite(closes, 21)
+      const { upper: bollU, mid: bollM, lower: bollL } = bollingerBands(closes, 20, 2)
+      const vw = vwapValues(highs, lows, closes, vols, 20)
+      const dema21 = demaValues(closes, 21)
+      const tema21 = temaValues(closes, 21)
+      const kama10 = kamaValues(closes, 10, 2, 30)
+      const hull9 = hullMaValues(closes, 9)
+      const { upper: kU, mid: kM, lower: kL } = keltnerChannelValues(highs, lows, closes, 20, 10, 1.5)
+      const { supertrend: stVal, direction: stDir } = supertrendValues(highs, lows, closes, 10, 3)
+      const { tenkan: ichTen, kijun: ichKij, spanA: ichSA, senkouB: ichSB } = ichimokuValues(highs, lows, closes)
+      const { sar: sarVal, direction: sarDir } = sarValues(highs, lows, closes, 0.02, 0.2)
+      const { upper: dcU, mid: dcM, lower: dcL } = donchianChannelValues(highs, lows, 20)
+      const { jaw: agJ, teeth: agT, lips: agL } = alligatorValues(highs, lows, closes)
+      const { directions: zzDir } = zigzagValues(highs, lows, closes, 5)
+      const { direction: satsDir } = satsValues(highs, lows, closes, vols)
+      const { pp: pivPP, s1: pivS1, r1: pivR1 } = pivotPointsValues(highs, lows, closes)
+      const { vwap: vbM, upper: vbU, lower: vbL } = vwapBandsValues(highs, lows, closes, vols)
+      const { dif: macdDif, dea: macdDea, hist: macdHist } = macdBundle(closes)
+      const rsi14 = rsiBundle(closes, 14)
+      const { K: kdjK, D: kdjD, J: kdjJ } = kdjBundle(highs, lows, closes, 9)
+      const cci20 = cciValues(highs, lows, closes, 20)
+      const wr14 = williamsRValues(highs, lows, closes, 14)
+      const { k: stochK, d: stochD } = stochRsiValues(closes, 14, 14, 3, 3)
+      const { adx: adxVal, diP: adxP, diM: adxM } = adxValues(highs, lows, closes, 14)
+      const { up: arUp, down: arDown } = aroonValues(highs, lows, 25)
+      const cmo14 = cmoValues(closes, 14)
+      const trix15 = trixValues(closes, 15)
+      const trixSig = emaLeadingNull(trix15, 9)
+      const roc12 = rocValues(closes, 12)
+      const coppock = coppockValues(closes)
+      const { smi: smiD, signal: smiS } = smiValues(highs, lows, closes)
+      const ao534 = aoValues(highs, lows)
+      const obv = obvValues(closes, vols)
+      const mfi14 = mfiValues(highs, lows, closes, vols, 14)
+      const cmf20 = cmfValues(highs, lows, closes, vols, 20)
+      const adLine = adValues(highs, lows, closes, vols)
+      const fi13 = forceIndexValues(closes, vols, 13)
+      const co310 = chaikinOscValues(highs, lows, closes, vols, 3, 10)
+      const atr14 = atrValues(highs, lows, closes, 14)
+      const chop14 = chopValues(highs, lows, closes, 14)
+      const miVal = massIndexValues(highs, lows)
+      // Mass 反转阈值按本标的 MI 自身分布自适应，与主图竖带、后端 OKX 闸门同口径
+      const miTh = massAdaptiveThresholds(miVal)
+      const uiVal = ulcerIndexValues(closes)
+      const { squeeze: ttmSq, momentum: ttmMo } = ttmSqueezeValues(highs, lows, closes)
+      const { bullPower: erBull, bearPower: erBear } = elderRayValues(highs, lows, closes, 13)
+      // 辅助：读取数组在 i 位置的值
+      const v = (arr, i) => (i >= 0 && i < arr.length && arr[i] != null && Number.isFinite(arr[i])) ? arr[i] : null
+      const vPrev = (arr, i) => v(arr, i - 1)
+      // 构建ZigZag方向缓存（找最近非零方向）
+      const zzLastDir = new Array(times.length).fill(0)
+      let lastNonZero = 0
+      for (let i = 0; i < zzDir.length; i++) {
+        if (zzDir[i] === 1 || zzDir[i] === -1) lastNonZero = zzDir[i]
+        zzLastDir[i] = lastNonZero
+      }
+      // 逐根K线评估
+      for (let i = 0; i < times.length; i++) {
+        const c = closes[i]
+        if (c == null || !Number.isFinite(c)) continue
+        let bull = 0, bear = 0, neut = 0, osci = 0, cnt = 0
+        // MA
+        { const a5=v(ma5,i),a10=v(ma10,i),a20=v(ma20,i),a60=v(ma60,i)
+          if(a5!=null&&a10!=null&&a20!=null&&a60!=null){cnt++;if(a5>a10&&a10>a20&&a20>a60)bull++;else if(a5<a10&&a10<a20&&a20<a60)bear++;else if((a5>a20&&a10<a60)||(a5<a20&&a10>a60))osci++;else neut++;} }
+        // EMA
+        { const e12=v(ema12,i),e21=v(ema21,i)
+          if(e12!=null&&e21!=null){cnt++;if(e12>e21)bull++;else if(e12<e21)bear++;else neut++;} }
+        // BOLL
+        { const bu=v(bollU,i),bm=v(bollM,i),bl=v(bollL,i)
+          if(bu!=null&&bm!=null&&bl!=null){cnt++;if(c>bu)bull++;else if(c<bl)bear++;else if(c>bm)osci++;else neut++;} }
+        // VWAP
+        { const vwv=v(vw,i);if(vwv!=null){cnt++;if(c>vwv)bull++;else if(c<vwv)bear++;else neut++;} }
+        // DEMA
+        { const dv=v(dema21,i);if(dv!=null){cnt++;if(c>dv)bull++;else if(c<dv)bear++;else neut++;} }
+        // TEMA
+        { const tv=v(tema21,i);if(tv!=null){cnt++;if(c>tv)bull++;else if(c<tv)bear++;else neut++;} }
+        // KAMA
+        { const kv=v(kama10,i),kp=vPrev(kama10,i)
+          if(kv!=null&&kp!=null){cnt++;if(c>kv&&kv>kp)bull++;else if(c<kv&&kv<kp)bear++;else neut++;} }
+        // HullMA
+        { const hv=v(hull9,i),hp=vPrev(hull9,i)
+          if(hv!=null&&hp!=null){cnt++;if(hv>hp)bull++;else if(hv<hp)bear++;else neut++;} }
+        // Keltner
+        { const ku=v(kU,i),kl=v(kL,i)
+          if(ku!=null&&kl!=null){cnt++;if(c>ku)bull++;else if(c<kl)bear++;else osci++;} }
+        // SuperTrend
+        { const sd=v(stDir,i);if(sd!=null){cnt++;if(sd===1)bull++;else if(sd===-1)bear++;else neut++;} }
+        // Ichimoku
+        { const it=v(ichTen,i),ik=v(ichKij,i),isa=v(ichSA,i),isb=v(ichSB,i)
+          if(it!=null&&ik!=null&&isa!=null&&isb!=null){const ct=Math.max(isa,isb),cb=Math.min(isa,isb);cnt++;if(c>ct&&it>ik)bull++;else if(c<cb&&it<ik)bear++;else if(c>=cb&&c<=ct)osci++;else neut++;} }
+        // SAR
+        { const sd=v(sarDir,i);if(sd!=null){cnt++;if(sd===1)bull++;else if(sd===-1)bear++;else neut++;} }
+        // Donchian
+        { const du=v(dcU,i),dl=v(dcL,i)
+          if(du!=null&&dl!=null){cnt++;if(c>=du)bull++;else if(c<=dl)bear++;else osci++;} }
+        // Alligator
+        { const aj=v(agJ,i),at=v(agT,i),al=v(agL,i)
+          if(aj!=null&&at!=null&&al!=null){cnt++;if(al>at&&at>aj)bull++;else if(al<at&&at<aj)bear++;else osci++;} }
+        // ZigZag
+        { const zd=zzLastDir[i];if(zd!==0){cnt++;if(zd===-1)bull++;else if(zd===1)bear++;else neut++;} }
+        // SATS
+        { const sd=v(satsDir,i);if(sd!=null){cnt++;if(sd===1)bull++;else if(sd===-1)bear++;else neut++;} }
+        // Pivot
+        { const pp=v(pivPP,i),s1=v(pivS1,i),r1=v(pivR1,i)
+          if(pp!=null&&r1!=null&&s1!=null){cnt++;if(c>r1)bull++;else if(c<s1)bear++;else if(c>pp)osci++;else neut++;} }
+        // VWAPBands
+        { const vu=v(vbU,i),vl=v(vbL,i)
+          if(vu!=null&&vl!=null){cnt++;if(c>vu)bull++;else if(c<vl)bear++;else osci++;} }
+        // MACD
+        { const md=v(macdDif,i),me=v(macdDea,i),mh=v(macdHist,i)
+          if(md!=null&&me!=null&&mh!=null){cnt++;if(md>me&&mh>0)bull++;else if(md<me&&mh<0)bear++;else if((md>0&&mh<0)||(md<0&&mh>0))osci++;else neut++;} }
+        // RSI
+        { const rv=v(rsi14,i);if(rv!=null){cnt++;if(rv>70)osci++;else if(rv<30)osci++;else if(rv>50)bull++;else bear++;} }
+        // KDJ
+        { const kk=v(kdjK,i),kd=v(kdjD,i),kj=v(kdjJ,i)
+          if(kk!=null&&kd!=null&&kj!=null){cnt++;if(kj>kk&&kk>kd&&kk<80)bull++;else if(kj<kk&&kk<kd&&kk>20)bear++;else if(kk>80)bear++;else if(kk<20)bull++;else osci++;} }
+        // CCI
+        { const cv=v(cci20,i);if(cv!=null){cnt++;if(cv>100)bull++;else if(cv<-100)bear++;else osci++;} }
+        // W%R
+        { const wv=v(wr14,i);if(wv!=null){cnt++;if(wv<-80)bull++;else if(wv>-20)bear++;else osci++;} }
+        // StochRSI
+        { const sk=v(stochK,i),sd2=v(stochD,i)
+          if(sk!=null&&sd2!=null){cnt++;if(sk<20&&sd2<20&&sk>sd2)bull++;else if(sk>80&&sd2>80&&sk<sd2)bear++;else osci++;} }
+        // ADX
+        { const av=v(adxVal,i),ap=v(adxP,i),am=v(adxM,i)
+          if(av!=null&&ap!=null&&am!=null){cnt++;if(av>25&&ap>am)bull++;else if(av>25&&ap<am)bear++;else osci++;} }
+        // Aroon
+        { const au=v(arUp,i),ad2=v(arDown,i)
+          if(au!=null&&ad2!=null){cnt++;if(au>70&&ad2<30)bull++;else if(ad2>70&&au<30)bear++;else osci++;} }
+        // CMO
+        { const cv=cmo14[i];if(cv!=null&&Number.isFinite(cv)){cnt++;if(cv>50)bull++;else if(cv<-50)bear++;else osci++;} }
+        // TRIX
+        { const tv=v(trix15,i),ts=v(trixSig,i)
+          if(tv!=null&&ts!=null){cnt++;if(tv>ts)bull++;else if(tv<ts)bear++;else neut++;} }
+        // ROC
+        { const rv=v(roc12,i);if(rv!=null){cnt++;if(rv>0)bull++;else if(rv<0)bear++;else neut++;} }
+        // Coppock
+        { const cv=v(coppock,i),cp=vPrev(coppock,i)
+          if(cv!=null&&cp!=null){cnt++;if(cv>0&&cp<=0)bull++;else if(cv<0)bear++;else neut++;} }
+        // SMI
+        { const sv=v(smiD,i),ss=v(smiS,i)
+          if(sv!=null&&ss!=null){cnt++;if(sv>ss&&sv>0)bull++;else if(sv<ss&&sv<0)bear++;else osci++;} }
+        // AO
+        { const av2=v(ao534,i),ap2=vPrev(ao534,i)
+          if(av2!=null&&ap2!=null){cnt++;if(av2>0&&av2>ap2)bull++;else if(av2<0&&av2<ap2)bear++;else if(av2>0&&av2<ap2)osci++;else neut++;} }
+        // OBV
+        { const ov=v(obv,i),op=vPrev(obv,i)
+          if(ov!=null&&op!=null){cnt++;if(ov>op)bull++;else if(ov<op)bear++;else neut++;} }
+        // MFI
+        { const mv=v(mfi14,i);if(mv!=null){cnt++;if(mv>80)osci++;else if(mv<20)osci++;else if(mv>50)bull++;else bear++;} }
+        // CMF
+        { const cv=v(cmf20,i);if(cv!=null){cnt++;if(cv>0.05)bull++;else if(cv<-0.05)bear++;else osci++;} }
+        // A/D
+        { const av3=v(adLine,i),ap3=vPrev(adLine,i)
+          if(av3!=null&&ap3!=null){cnt++;if(av3>ap3)bull++;else if(av3<ap3)bear++;else neut++;} }
+        // FI
+        { const fv=v(fi13,i);if(fv!=null){cnt++;if(fv>0)bull++;else if(fv<0)bear++;else neut++;} }
+        // ChaikinOsc
+        { const cv=v(co310,i),cp=vPrev(co310,i)
+          if(cv!=null&&cp!=null){cnt++;if(cv>0&&cv>cp)bull++;else if(cv<0&&cv<cp)bear++;else osci++;} }
+        // ATR
+        { const av4=v(atr14,i),ap4=vPrev(atr14,i)
+          if(av4!=null&&ap4!=null){cnt++;if(av4>ap4)osci++;else neut++;} }
+        // CHOP
+        { const cv2=v(chop14,i);if(cv2!=null){cnt++;if(cv2>61.8)osci++;else neut++;} }
+        // MassIndex
+        { const mv2=v(miVal,i),mp=vPrev(miVal,i)
+          if(mv2!=null&&mp!=null){cnt++;if(mp>=miTh.enter&&mv2<miTh.exit)bull++;else neut++;} }
+        // UlcerIndex
+        { const uv=v(uiVal,i);if(uv!=null){cnt++;if(uv<5)bull++;else if(uv>15)bear++;else neut++;} }
+        // TTM
+        { const sq=v(ttmSq,i),mo=v(ttmMo,i)
+          if(sq!=null&&mo!=null){cnt++;if(!sq&&mo>0)bull++;else if(!sq&&mo<0)bear++;else if(sq)osci++;else neut++;} }
+        // ElderRay
+        { const bp=v(erBull,i),brp=v(erBear,i)
+          if(bp!=null&&brp!=null){cnt++;if(bp>0&&bp>brp)bull++;else if(brp<0&&brp<bp)bear++;else osci++;} }
+        // 汇总
+        if (cnt > 0) {
+          bullishArr[i] = (bull / cnt) * 100
+          bearishArr[i] = (bear / cnt) * 100
+          netArr[i] = ((bull - bear) / cnt) * 100
+        }
+      }
+      ind.signalRatioBullish = chart.addSeries(
+        LineSeries,
+        {
+          ...subLineOpts,
+          color: 'rgba(239, 68, 68, 0.7)',
+          lineWidth: 1,
+          title: '看多%',
+          priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
+        },
+        paneIdx,
+      )
+      ind.signalRatioBearish = chart.addSeries(
+        LineSeries,
+        {
+          ...subLineOpts,
+          color: 'rgba(34, 197, 94, 0.7)',
+          lineWidth: 1,
+          title: '看空%',
+          priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
+        },
+        paneIdx,
+      )
+      ind.signalRatioNet = chart.addSeries(
+        LineSeries,
+        {
+          ...subLineOpts,
+          color: '#f59e0b',
+          lineWidth: 2,
+          title: '净信号',
+          priceFormat: { type: 'price', precision: 1, minMove: 0.1 },
+        },
+        paneIdx,
+      )
+      ind.signalRatioBullish.setData(toLineData(times, bullishArr))
+      ind.signalRatioBearish.setData(toLineData(times, bearishArr))
+      ind.signalRatioNet.setData(toLineData(times, netArr))
+    } else if (key === 'weisWave') {
+      // Weis Wave：ZigZag 波段量能累积（红=上涨波段推力，绿=下跌波段推力）
+      const zz = zigzagValues(highs, lows, closes, 5)
+      const { wave, colors } = weisWaveValues(vols, zz)
+      ind.weisWave = chart.addSeries(
+        HistogramSeries,
+        {
+          title: 'WeisWave',
+          priceLineVisible: false,
+          lastValueVisible: false,
+          priceFormat: { type: 'volume' },
+        },
+        paneIdx,
+      )
+      const wwData = []
+      for (let i = 0; i < times.length; i++) {
+        if (wave[i] == null) continue
+        wwData.push({
+          time: times[i],
+          value: wave[i],
+          color: colors[i] === 1 ? 'rgba(239,68,68,0.75)' : 'rgba(34,197,94,0.75)',
+        })
+      }
+      ind.weisWave.setData(wwData)
     }
     paneIdx++
   }
@@ -1081,12 +1818,29 @@ function syncSubPaneIndicators(times, closes, highs, lows, vols) {
 function syncIndicators() {
   if (!chart || !candleSeries) return
 
+  // 成交量分布为 primitive（非 series），不参与下方 series 重建，单独同步挂载状态
+  syncVolumeProfilePrimitive()
+  // 神奇九转为 primitive（数字标记），单独同步
+  syncTDSequentialPrimitive()
+  // Mass Index 反转窗口为 primitive（主图竖带），随 Mass 开关同步
+  syncMassZonePrimitive()
+  // 自动背离为 primitive（主图连线+徽章），单独同步
+  syncDivergencePrimitive()
+  // 买卖点预测为 primitive（主图箭头标注），单独同步
+  syncBuySellPrimitive()
+  // TEMA 斜率转折为 primitive（主图预警/确认标记），单独同步
+  syncTemaTurnPrimitive()
+  // BBI 主图叠加线、涨跌停价位线
+  syncBBISeries()
+  syncLimitPriceLines()
+
   const { times, opens, closes, highs, lows, vols } = extractOHLCV(mergedRawRows)
   if (!times.length) {
     ind.ma5 = removeSeriesSafe(ind.ma5)
     ind.ma10 = removeSeriesSafe(ind.ma10)
     ind.ma20 = removeSeriesSafe(ind.ma20)
     ind.ma60 = removeSeriesSafe(ind.ma60)
+    ind.ma250 = removeSeriesSafe(ind.ma250)
     ind.bollU = removeSeriesSafe(ind.bollU)
     ind.bollM = removeSeriesSafe(ind.bollM)
     ind.bollL = removeSeriesSafe(ind.bollL)
@@ -1136,8 +1890,8 @@ function syncIndicators() {
     ind.smcIntLow = removeSeriesSafe(ind.smcIntLow)
     ind.smcBos = removeSeriesSafe(ind.smcBos)
     ind.smcChoch = removeSeriesSafe(ind.smcChoch)
-    ind.smcSwingBos = removeSeriesSafe(ind.smcSwingBos)
-    ind.smcSwingChoch = removeSeriesSafe(ind.smcSwingChoch)
+    ind.smcSwBos = removeSeriesSafe(ind.smcSwBos)
+    ind.smcSwChoch = removeSeriesSafe(ind.smcSwChoch)
     ind.smcFvgTop = removeSeriesSafe(ind.smcFvgTop)
     ind.smcFvgBot = removeSeriesSafe(ind.smcFvgBot)
     ind.smcObTop = removeSeriesSafe(ind.smcObTop)
@@ -1157,6 +1911,7 @@ function syncIndicators() {
     const m10 = smaValues(closes, 10)
     const m20 = smaValues(closes, 20)
     const m60 = smaValues(closes, 60)
+    const m250 = smaValues(closes, 250)
     if (!ind.ma5) {
       ind.ma5 = chart.addSeries(
         LineSeries,
@@ -1185,15 +1940,24 @@ function syncIndicators() {
         0,
       )
     }
+    if (!ind.ma250) {
+      ind.ma250 = chart.addSeries(
+        LineSeries,
+        { ...lineCommon, color: '#db2777', title: 'MA250' },
+        0,
+      )
+    }
     ind.ma5.setData(toLineData(times, m5))
     ind.ma10.setData(toLineData(times, m10))
     ind.ma20.setData(toLineData(times, m20))
     ind.ma60.setData(toLineData(times, m60))
+    ind.ma250.setData(toLineData(times, m250))
   } else {
     ind.ma5 = removeSeriesSafe(ind.ma5)
     ind.ma10 = removeSeriesSafe(ind.ma10)
     ind.ma20 = removeSeriesSafe(ind.ma20)
     ind.ma60 = removeSeriesSafe(ind.ma60)
+    ind.ma250 = removeSeriesSafe(ind.ma250)
   }
 
   if (showBOLL.value) {
@@ -1748,143 +2512,33 @@ function syncIndicators() {
   if (showSMC.value) {
     const smc = smcValues(highs, lows, closes, opens)
     if (!ind.smcSwingHigh) {
-      ind.smcSwingHigh = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 6, color: '#ef4444', title: 'SwH' },
-        0,
-      )
+      ind.smcSwingHigh = chart.addSeries(LineSeries, { ...lineCommon, color: '#ef4444', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 6, title: 'SwH', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcSwingLow = chart.addSeries(LineSeries, { ...lineCommon, color: '#22c55e', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 6, title: 'SwL', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcIntHigh = chart.addSeries(LineSeries, { ...lineCommon, color: '#f87171', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 3, title: 'iH', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcIntLow = chart.addSeries(LineSeries, { ...lineCommon, color: '#4ade80', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 3, title: 'iL', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcBos = chart.addSeries(LineSeries, { ...lineCommon, color: '#3b82f6', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 4, title: 'BOS', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcChoch = chart.addSeries(LineSeries, { ...lineCommon, color: '#f59e0b', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 4, title: 'CHoCH', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcSwBos = chart.addSeries(LineSeries, { ...lineCommon, color: '#6366f1', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 5, title: 'SwBOS', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcSwChoch = chart.addSeries(LineSeries, { ...lineCommon, color: '#eab308', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 5, title: 'SwCHoCH', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcFvgTop = chart.addSeries(LineSeries, { ...lineCommon, color: '#ef4444', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 2, title: 'FVG↑', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcFvgBot = chart.addSeries(LineSeries, { ...lineCommon, color: '#22c55e', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 2, title: 'FVG↓', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcObTop = chart.addSeries(LineSeries, { ...lineCommon, color: '#ef4444', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 3, title: 'OB↑', lastValueVisible: false, priceLineVisible: false }, 0)
+      ind.smcObBot = chart.addSeries(LineSeries, { ...lineCommon, color: '#22c55e', lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 3, title: 'OB↓', lastValueVisible: false, priceLineVisible: false }, 0)
     }
-    if (!ind.smcSwingLow) {
-      ind.smcSwingLow = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 6, color: '#22c55e', title: 'SwL' },
-        0,
-      )
-    }
-    if (!ind.smcIntHigh) {
-      ind.smcIntHigh = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 3, color: '#f87171', title: 'iH' },
-        0,
-      )
-    }
-    if (!ind.smcIntLow) {
-      ind.smcIntLow = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 3, color: '#4ade80', title: 'iL' },
-        0,
-      )
-    }
-    ind.smcSwingHigh.setData(toLineData(times, smc.swingHighs))
-    ind.smcSwingLow.setData(toLineData(times, smc.swingLows))
-    ind.smcIntHigh.setData(toLineData(times, smc.intHighs))
-    ind.smcIntLow.setData(toLineData(times, smc.intLows))
-
-    const bosData = []
-    for (const b of smc.bosLines) {
-      bosData.push({ time: times[b.toIdx], value: b.toPrice, color: '#3b82f6' })
-    }
-    bosData.sort((a, b) => a.time - b.time)
-    if (!ind.smcBos) {
-      ind.smcBos = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 4, color: '#3b82f6', title: 'BOS' },
-        0,
-      )
-    }
-    ind.smcBos.setData(bosData)
-
-    const chochData = []
-    for (const c of smc.chochLines) {
-      chochData.push({ time: times[c.toIdx], value: c.toPrice, color: '#f59e0b' })
-    }
-    chochData.sort((a, b) => a.time - b.time)
-    if (!ind.smcChoch) {
-      ind.smcChoch = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 4, color: '#f59e0b', title: 'CHoCH' },
-        0,
-      )
-    }
-    ind.smcChoch.setData(chochData)
-
-    const swingBosData = []
-    for (const b of smc.swingBosLines) {
-      swingBosData.push({ time: times[b.toIdx], value: b.toPrice, color: '#6366f1' })
-    }
-    swingBosData.sort((a, b) => a.time - b.time)
-    if (!ind.smcSwingBos) {
-      ind.smcSwingBos = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 5, color: '#6366f1', title: 'SwBOS' },
-        0,
-      )
-    }
-    ind.smcSwingBos.setData(swingBosData)
-
-    const swingChochData = []
-    for (const c of smc.swingChochLines) {
-      swingChochData.push({ time: times[c.toIdx], value: c.toPrice, color: '#eab308' })
-    }
-    swingChochData.sort((a, b) => a.time - b.time)
-    if (!ind.smcSwingChoch) {
-      ind.smcSwingChoch = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 5, color: '#eab308', title: 'SwCHoCH' },
-        0,
-      )
-    }
-    ind.smcSwingChoch.setData(swingChochData)
-
-    const fvgTopData = []
-    const fvgBotData = []
-    for (const fz of smc.fvgZones) {
-      if (fz.mitigated) continue
-      fvgTopData.push({ time: times[fz.startIdx], value: fz.top, color: fz.bull ? '#ef4444' : '#22c55e' })
-      fvgBotData.push({ time: times[fz.startIdx], value: fz.bot, color: fz.bull ? '#ef4444' : '#22c55e' })
-    }
-    fvgTopData.sort((a, b) => a.time - b.time)
-    fvgBotData.sort((a, b) => a.time - b.time)
-    if (!ind.smcFvgTop) {
-      ind.smcFvgTop = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 3, color: '#ef4444', title: 'FVG上' },
-        0,
-      )
-    }
-    if (!ind.smcFvgBot) {
-      ind.smcFvgBot = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 3, color: '#22c55e', title: 'FVG下' },
-        0,
-      )
-    }
+    ind.smcSwingHigh.setData(smc.swingHighPoints.map(p => ({ time: times[p.idx], value: p.price })).sort((a, b) => a.time - b.time))
+    ind.smcSwingLow.setData(smc.swingLowPoints.map(p => ({ time: times[p.idx], value: p.price })).sort((a, b) => a.time - b.time))
+    ind.smcIntHigh.setData(smc.intHighPoints.map(p => ({ time: times[p.idx], value: p.price })).sort((a, b) => a.time - b.time))
+    ind.smcIntLow.setData(smc.intLowPoints.map(p => ({ time: times[p.idx], value: p.price })).sort((a, b) => a.time - b.time))
+    ind.smcBos.setData(smc.bosLines.map(b => ({ time: times[b.toIdx], value: b.toPrice })).sort((a, b) => a.time - b.time))
+    ind.smcChoch.setData(smc.chochLines.map(b => ({ time: times[b.toIdx], value: b.toPrice })).sort((a, b) => a.time - b.time))
+    ind.smcSwBos.setData(smc.swingBosLines.map(b => ({ time: times[b.toIdx], value: b.toPrice })).sort((a, b) => a.time - b.time))
+    ind.smcSwChoch.setData(smc.swingChochLines.map(b => ({ time: times[b.toIdx], value: b.toPrice })).sort((a, b) => a.time - b.time))
+    const fvgTopData = smc.fvgZones.filter(z => !z.mitigated).map(z => ({ time: times[z.startIdx], value: z.top })).sort((a, b) => a.time - b.time)
+    const fvgBotData = smc.fvgZones.filter(z => !z.mitigated).map(z => ({ time: times[z.startIdx], value: z.bot })).sort((a, b) => a.time - b.time)
     ind.smcFvgTop.setData(fvgTopData)
     ind.smcFvgBot.setData(fvgBotData)
-
-    const obTopData = []
-    const obBotData = []
-    for (const ob of smc.orderBlocks) {
-      if (ob.mitigated) continue
-      obTopData.push({ time: times[ob.idx], value: ob.top, color: ob.bull ? '#ef4444' : '#22c55e' })
-      obBotData.push({ time: times[ob.idx], value: ob.bot, color: ob.bull ? '#ef4444' : '#22c55e' })
-    }
-    obTopData.sort((a, b) => a.time - b.time)
-    obBotData.sort((a, b) => a.time - b.time)
-    if (!ind.smcObTop) {
-      ind.smcObTop = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 4, color: '#ef4444', title: 'OB上' },
-        0,
-      )
-    }
-    if (!ind.smcObBot) {
-      ind.smcObBot = chart.addSeries(
-        LineSeries,
-        { ...lineCommon, lineWidth: 0, pointMarkersVisible: true, pointMarkersRadius: 4, color: '#22c55e', title: 'OB下' },
-        0,
-      )
-    }
+    const obTopData = smc.orderBlocks.filter(o => !o.mitigated).map(o => ({ time: times[o.idx], value: o.top })).sort((a, b) => a.time - b.time)
+    const obBotData = smc.orderBlocks.filter(o => !o.mitigated).map(o => ({ time: times[o.idx], value: o.bot })).sort((a, b) => a.time - b.time)
     ind.smcObTop.setData(obTopData)
     ind.smcObBot.setData(obBotData)
   } else {
@@ -1894,8 +2548,8 @@ function syncIndicators() {
     ind.smcIntLow = removeSeriesSafe(ind.smcIntLow)
     ind.smcBos = removeSeriesSafe(ind.smcBos)
     ind.smcChoch = removeSeriesSafe(ind.smcChoch)
-    ind.smcSwingBos = removeSeriesSafe(ind.smcSwingBos)
-    ind.smcSwingChoch = removeSeriesSafe(ind.smcSwingChoch)
+    ind.smcSwBos = removeSeriesSafe(ind.smcSwBos)
+    ind.smcSwChoch = removeSeriesSafe(ind.smcSwChoch)
     ind.smcFvgTop = removeSeriesSafe(ind.smcFvgTop)
     ind.smcFvgBot = removeSeriesSafe(ind.smcFvgBot)
     ind.smcObTop = removeSeriesSafe(ind.smcObTop)
@@ -1968,6 +2622,22 @@ function formatPanelTitleDay(r) {
   return formatCrosshairTime(t)
 }
 
+/** 标题行最新价/涨跌幅：始终取数据中最新一根 K 线（不随十字线漂移），实时刷新后自动更新；
+ *  涨跌幅沿用 K 线自带口径（日线=当日相对昨收，周/月K=相对上一周期） */
+const titleQuote = computed(() => {
+  const r = defaultLatestRawRow.value
+  if (!r) return null
+  const close = parseNumStr(r.close)
+  const pct = parseNumStr(r.changePercent)
+  const neu = props.darkTheme ? '#94a3b8' : '#64748b'
+  const color = pct > 0 ? CLR_RISE : pct < 0 ? CLR_FALL : neu
+  return {
+    price: Number.isFinite(close) ? close.toFixed(2) : '--',
+    pct: Number.isFinite(pct) ? `${pct > 0 ? '+' : ''}${pct.toFixed(2)}%` : '--',
+    color,
+  }
+})
+
 const crosshairPanel = computed(() => {
   const r = hoverRawRow.value ?? defaultLatestRawRow.value
   if (!r) return null
@@ -2002,8 +2672,10 @@ const crosshairPanel = computed(() => {
     if (Number.isFinite(a10)) amp10 = a10.toFixed(2) + '%'
     if (Number.isFinite(a20)) amp20 = a20.toFixed(2) + '%'
   }
+  // 标题带上周期标签：周K/月K的涨跌幅是"上周期收盘"口径，不带标签极易误读成日K涨跌幅
+  const kltLabel = INTERVALS.find((it) => it.klt === activeKlt.value)?.label || ''
   return {
-    title: showLatestTag ? `${titleDay} · 最新` : titleDay,
+    title: [titleDay, kltLabel, showLatestTag ? '最新' : ''].filter(Boolean).join(' · '),
     open: formatPrice2(r.open),
     close: formatPrice2(r.close),
     high: formatPrice2(r.high),
@@ -2017,11 +2689,599 @@ const crosshairPanel = computed(() => {
     avgAmp10: amp10,
     avgAmp20: amp20,
     turnoverRate: formatPctField(r.turnoverRate),
+    volumeRatio: formatVolumeRatio(r.volumeRatio),
     cOpenClose: ohlcC,
     cHigh: CLR_RISE,
     cLow: CLR_FALL,
     cChg: chgC,
     cNeu: neu,
+  }
+})
+
+function evaluateIndicatorSignals(endIdx) {
+  const rows = mergedRawRows
+  if (!rows || rows.length < 2) return []
+
+  // 截取到 endIdx（含），使指标计算基于该 K 线位置的数据
+  const sliced = endIdx != null && endIdx >= 0 && endIdx < rows.length - 1
+    ? rows.slice(0, endIdx + 1)
+    : rows
+  const { times, opens, closes, highs, lows, vols } = extractOHLCV(sliced)
+  const n = times.length
+  if (n < 2) return []
+
+  const last = (arr) => {
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (arr[i] != null && Number.isFinite(arr[i])) return arr[i]
+    }
+    return null
+  }
+  const prev = (arr) => {
+    let cnt = 0
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (arr[i] != null && Number.isFinite(arr[i])) {
+        cnt++
+        if (cnt === 2) return arr[i]
+      }
+    }
+    return null
+  }
+  const signals = []
+
+  // ── Trend indicators ──
+
+  // MA
+  {
+    const m5 = smaValues(closes, 5)
+    const m10 = smaValues(closes, 10)
+    const m20 = smaValues(closes, 20)
+    const m60 = smaValues(closes, 60)
+    const v5 = last(m5), v10 = last(m10), v20 = last(m20), v60 = last(m60)
+    if (v5 != null && v10 != null && v20 != null && v60 != null) {
+      if (v5 > v10 && v10 > v20 && v20 > v60) signals.push({ name: 'MA', signal: 'bullish' })
+      else if (v5 < v10 && v10 < v20 && v20 < v60) signals.push({ name: 'MA', signal: 'bearish' })
+      else if ((v5 > v20 && v10 < v60) || (v5 < v20 && v10 > v60)) signals.push({ name: 'MA', signal: 'oscillating' })
+      else signals.push({ name: 'MA', signal: 'neutral' })
+    }
+  }
+
+  // EMA
+  {
+    const e12 = emaFinite(closes, 12)
+    const e21 = emaFinite(closes, 21)
+    const v12 = last(e12), v21 = last(e21)
+    if (v12 != null && v21 != null) {
+      if (v12 > v21) signals.push({ name: 'EMA', signal: 'bullish' })
+      else if (v12 < v21) signals.push({ name: 'EMA', signal: 'bearish' })
+      else signals.push({ name: 'EMA', signal: 'neutral' })
+    }
+  }
+
+  // BOLL
+  {
+    const { upper, mid, lower } = bollingerBands(closes, 20, 2)
+    const vU = last(upper), vM = last(mid), vL = last(lower), c = closes[n - 1]
+    if (vU != null && vM != null && vL != null) {
+      if (c > vU) signals.push({ name: 'BOLL', signal: 'bullish' })
+      else if (c < vL) signals.push({ name: 'BOLL', signal: 'bearish' })
+      else if (c > vM) signals.push({ name: 'BOLL', signal: 'oscillating' })
+      else signals.push({ name: 'BOLL', signal: 'neutral' })
+    }
+  }
+
+  // VWAP
+  {
+    const vw = vwapValues(highs, lows, closes, vols, 20)
+    const v = last(vw), c = closes[n - 1]
+    if (v != null) {
+      if (c > v) signals.push({ name: 'VWAP', signal: 'bullish' })
+      else if (c < v) signals.push({ name: 'VWAP', signal: 'bearish' })
+      else signals.push({ name: 'VWAP', signal: 'neutral' })
+    }
+  }
+
+  // DEMA
+  {
+    const d = demaValues(closes, 21)
+    const v = last(d), c = closes[n - 1]
+    if (v != null) {
+      if (c > v) signals.push({ name: 'DEMA', signal: 'bullish' })
+      else if (c < v) signals.push({ name: 'DEMA', signal: 'bearish' })
+      else signals.push({ name: 'DEMA', signal: 'neutral' })
+    }
+  }
+
+  // TEMA
+  {
+    const t = temaValues(closes, 21)
+    const v = last(t), c = closes[n - 1]
+    if (v != null) {
+      if (c > v) signals.push({ name: 'TEMA', signal: 'bullish' })
+      else if (c < v) signals.push({ name: 'TEMA', signal: 'bearish' })
+      else signals.push({ name: 'TEMA', signal: 'neutral' })
+    }
+  }
+
+  // TEMA 斜率（趋势反转点）
+  {
+    const slope = temaSlopeValues(closes, 21)
+    const v = last(slope)
+    if (v != null) {
+      if (v > 0) signals.push({ name: 'TEMA斜率', signal: 'bullish' })
+      else if (v < 0) signals.push({ name: 'TEMA斜率', signal: 'bearish' })
+      else signals.push({ name: 'TEMA斜率', signal: 'neutral' })
+    }
+  }
+
+  // KAMA
+  {
+    const k = kamaValues(closes, 10, 2, 30)
+    const v = last(k), c = closes[n - 1], pv = prev(k)
+    if (v != null && pv != null) {
+      if (c > v && v > pv) signals.push({ name: 'KAMA', signal: 'bullish' })
+      else if (c < v && v < pv) signals.push({ name: 'KAMA', signal: 'bearish' })
+      else signals.push({ name: 'KAMA', signal: 'neutral' })
+    }
+  }
+
+  // HullMA
+  {
+    const h = hullMaValues(closes, 9)
+    const v = last(h), pv = prev(h)
+    if (v != null && pv != null) {
+      if (v > pv) signals.push({ name: 'HullMA', signal: 'bullish' })
+      else if (v < pv) signals.push({ name: 'HullMA', signal: 'bearish' })
+      else signals.push({ name: 'HullMA', signal: 'neutral' })
+    }
+  }
+
+  // Keltner
+  {
+    const { upper: kU, mid: kM, lower: kL } = keltnerChannelValues(highs, lows, closes, 20, 10, 1.5)
+    const vU = last(kU), vM = last(kM), vL = last(kL), c = closes[n - 1]
+    if (vU != null && vL != null) {
+      if (c > vU) signals.push({ name: 'Keltner', signal: 'bullish' })
+      else if (c < vL) signals.push({ name: 'Keltner', signal: 'bearish' })
+      else signals.push({ name: 'Keltner', signal: 'oscillating' })
+    }
+  }
+
+  // SuperTrend
+  {
+    const { supertrend: stVal, direction } = supertrendValues(highs, lows, closes, 10, 3)
+    const d = last(direction)
+    if (d != null) {
+      if (d === 1) signals.push({ name: 'SuperTrend', signal: 'bullish' })
+      else if (d === -1) signals.push({ name: 'SuperTrend', signal: 'bearish' })
+      else signals.push({ name: 'SuperTrend', signal: 'neutral' })
+    }
+  }
+
+  // Ichimoku
+  {
+    const { tenkan, kijun, spanA, senkouB } = ichimokuValues(highs, lows, closes)
+    const vT = last(tenkan), vK = last(kijun), vSA = last(spanA), vSB = last(senkouB), c = closes[n - 1]
+    if (vT != null && vK != null && vSA != null && vSB != null) {
+      const cloudTop = Math.max(vSA, vSB)
+      const cloudBot = Math.min(vSA, vSB)
+      if (c > cloudTop && vT > vK) signals.push({ name: 'Ichimoku', signal: 'bullish' })
+      else if (c < cloudBot && vT < vK) signals.push({ name: 'Ichimoku', signal: 'bearish' })
+      else if (c >= cloudBot && c <= cloudTop) signals.push({ name: 'Ichimoku', signal: 'oscillating' })
+      else signals.push({ name: 'Ichimoku', signal: 'neutral' })
+    }
+  }
+
+  // SAR
+  {
+    const { sar, direction } = sarValues(highs, lows, closes, 0.02, 0.2)
+    const d = last(direction)
+    if (d != null) {
+      if (d === 1) signals.push({ name: 'SAR', signal: 'bullish' })
+      else if (d === -1) signals.push({ name: 'SAR', signal: 'bearish' })
+      else signals.push({ name: 'SAR', signal: 'neutral' })
+    }
+  }
+
+  // Donchian
+  {
+    const { upper, mid, lower } = donchianChannelValues(highs, lows, 20)
+    const vU = last(upper), vL = last(lower), c = closes[n - 1]
+    if (vU != null && vL != null) {
+      if (c >= vU) signals.push({ name: 'Donchian', signal: 'bullish' })
+      else if (c <= vL) signals.push({ name: 'Donchian', signal: 'bearish' })
+      else signals.push({ name: 'Donchian', signal: 'oscillating' })
+    }
+  }
+
+  // Alligator
+  {
+    const { jaw, teeth, lips } = alligatorValues(highs, lows, closes)
+    const vJ = last(jaw), vT = last(teeth), vL = last(lips)
+    if (vJ != null && vT != null && vL != null) {
+      if (vL > vT && vT > vJ) signals.push({ name: 'Alligator', signal: 'bullish' })
+      else if (vL < vT && vT < vJ) signals.push({ name: 'Alligator', signal: 'bearish' })
+      else signals.push({ name: 'Alligator', signal: 'oscillating' })
+    }
+  }
+
+  // ZigZag
+  {
+    const { directions } = zigzagValues(highs, lows, closes, 5)
+    let zzDir = 0
+    for (let i = directions.length - 1; i >= 0; i--) {
+      if (directions[i] === 1 || directions[i] === -1) { zzDir = directions[i]; break }
+    }
+    if (zzDir === -1) signals.push({ name: 'ZigZag', signal: 'bullish' })
+    else if (zzDir === 1) signals.push({ name: 'ZigZag', signal: 'bearish' })
+    else signals.push({ name: 'ZigZag', signal: 'neutral' })
+  }
+
+  // SATS
+  {
+    const { direction } = satsValues(highs, lows, closes, vols)
+    const d = last(direction)
+    if (d != null) {
+      if (d === 1) signals.push({ name: 'SATS', signal: 'bullish' })
+      else if (d === -1) signals.push({ name: 'SATS', signal: 'bearish' })
+      else signals.push({ name: 'SATS', signal: 'neutral' })
+    }
+  }
+
+  // Pivot
+  {
+    const { pp, s1, r1 } = pivotPointsValues(highs, lows, closes)
+    const vPP = last(pp), vS1 = last(s1), vR1 = last(r1), c = closes[n - 1]
+    if (vPP != null && vR1 != null && vS1 != null) {
+      if (c > vR1) signals.push({ name: 'Pivot', signal: 'bullish' })
+      else if (c < vS1) signals.push({ name: 'Pivot', signal: 'bearish' })
+      else if (c > vPP) signals.push({ name: 'Pivot', signal: 'oscillating' })
+      else signals.push({ name: 'Pivot', signal: 'neutral' })
+    }
+  }
+
+  // VWAPBands
+  {
+    const { vwap: vbM, upper: vbU, lower: vbL } = vwapBandsValues(highs, lows, closes, vols)
+    const vU = last(vbU), vL = last(vbL), c = closes[n - 1]
+    if (vU != null && vL != null) {
+      if (c > vU) signals.push({ name: 'VWAPBands', signal: 'bullish' })
+      else if (c < vL) signals.push({ name: 'VWAPBands', signal: 'bearish' })
+      else signals.push({ name: 'VWAPBands', signal: 'oscillating' })
+    }
+  }
+
+  // ── Momentum / oscillator indicators ──
+
+  // MACD
+  {
+    const { dif, dea, hist } = macdBundle(closes)
+    const vDif = last(dif), vDea = last(dea), vHist = last(hist), pHist = prev(hist)
+    if (vDif != null && vDea != null && vHist != null) {
+      if (vDif > vDea && vHist > 0) signals.push({ name: 'MACD', signal: 'bullish' })
+      else if (vDif < vDea && vHist < 0) signals.push({ name: 'MACD', signal: 'bearish' })
+      else if (vDif > 0 && vHist < 0) signals.push({ name: 'MACD', signal: 'oscillating' })
+      else if (vDif < 0 && vHist > 0) signals.push({ name: 'MACD', signal: 'oscillating' })
+      else signals.push({ name: 'MACD', signal: 'neutral' })
+    }
+  }
+
+  // RSI
+  {
+    const rsi = rsiBundle(closes, 14)
+    const v = last(rsi)
+    if (v != null) {
+      if (v > 70) signals.push({ name: 'RSI', signal: 'oscillating' })
+      else if (v < 30) signals.push({ name: 'RSI', signal: 'oscillating' })
+      else if (v > 50) signals.push({ name: 'RSI', signal: 'bullish' })
+      else signals.push({ name: 'RSI', signal: 'bearish' })
+    }
+  }
+
+  // KDJ
+  {
+    const { K, D, J } = kdjBundle(highs, lows, closes, 9)
+    const vK = last(K), vD = last(D), vJ = last(J)
+    if (vK != null && vD != null && vJ != null) {
+      if (vJ > vK && vK > vD && vK < 80) signals.push({ name: 'KDJ', signal: 'bullish' })
+      else if (vJ < vK && vK < vD && vK > 20) signals.push({ name: 'KDJ', signal: 'bearish' })
+      else if (vK > 80) signals.push({ name: 'KDJ', signal: 'bearish' })
+      else if (vK < 20) signals.push({ name: 'KDJ', signal: 'bullish' })
+      else signals.push({ name: 'KDJ', signal: 'oscillating' })
+    }
+  }
+
+  // CCI
+  {
+    const cci = cciValues(highs, lows, closes, 20)
+    const v = last(cci)
+    if (v != null) {
+      if (v > 100) signals.push({ name: 'CCI', signal: 'bullish' })
+      else if (v < -100) signals.push({ name: 'CCI', signal: 'bearish' })
+      else signals.push({ name: 'CCI', signal: 'oscillating' })
+    }
+  }
+
+  // Williams %R
+  {
+    const wr = williamsRValues(highs, lows, closes, 14)
+    const v = last(wr)
+    if (v != null) {
+      if (v < -80) signals.push({ name: 'W%R', signal: 'bullish' })
+      else if (v > -20) signals.push({ name: 'W%R', signal: 'bearish' })
+      else signals.push({ name: 'W%R', signal: 'oscillating' })
+    }
+  }
+
+  // StochRSI
+  {
+    const { k, d } = stochRsiValues(closes, 14, 14, 3, 3)
+    const vK = last(k), vD = last(d)
+    if (vK != null && vD != null) {
+      if (vK < 20 && vD < 20 && vK > vD) signals.push({ name: 'StochRSI', signal: 'bullish' })
+      else if (vK > 80 && vD > 80 && vK < vD) signals.push({ name: 'StochRSI', signal: 'bearish' })
+      else signals.push({ name: 'StochRSI', signal: 'oscillating' })
+    }
+  }
+
+  // ADX
+  {
+    const { adx, diP, diM } = adxValues(highs, lows, closes, 14)
+    const vAdx = last(adx), vP = last(diP), vM = last(diM)
+    if (vAdx != null && vP != null && vM != null) {
+      if (vAdx > 25 && vP > vM) signals.push({ name: 'ADX', signal: 'bullish' })
+      else if (vAdx > 25 && vP < vM) signals.push({ name: 'ADX', signal: 'bearish' })
+      else signals.push({ name: 'ADX', signal: 'oscillating' })
+    }
+  }
+
+  // Aroon
+  {
+    const { up, down } = aroonValues(highs, lows, 25)
+    const vU = last(up), vD = last(down)
+    if (vU != null && vD != null) {
+      if (vU > 70 && vD < 30) signals.push({ name: 'Aroon', signal: 'bullish' })
+      else if (vD > 70 && vU < 30) signals.push({ name: 'Aroon', signal: 'bearish' })
+      else signals.push({ name: 'Aroon', signal: 'oscillating' })
+    }
+  }
+
+  // CMO
+  {
+    const cmo = cmoValues(closes, 14)
+    const v = last(cmo)
+    if (v != null) {
+      if (v > 50) signals.push({ name: 'CMO', signal: 'bullish' })
+      else if (v < -50) signals.push({ name: 'CMO', signal: 'bearish' })
+      else signals.push({ name: 'CMO', signal: 'oscillating' })
+    }
+  }
+
+  // TRIX
+  {
+    const trix = trixValues(closes, 15)
+    const signal = emaLeadingNull(trix, 9)
+    const vT = last(trix), vS = last(signal)
+    if (vT != null && vS != null) {
+      if (vT > vS) signals.push({ name: 'TRIX', signal: 'bullish' })
+      else if (vT < vS) signals.push({ name: 'TRIX', signal: 'bearish' })
+      else signals.push({ name: 'TRIX', signal: 'neutral' })
+    }
+  }
+
+  // ROC
+  {
+    const roc = rocValues(closes, 12)
+    const v = last(roc)
+    if (v != null) {
+      if (v > 0) signals.push({ name: 'ROC', signal: 'bullish' })
+      else if (v < 0) signals.push({ name: 'ROC', signal: 'bearish' })
+      else signals.push({ name: 'ROC', signal: 'neutral' })
+    }
+  }
+
+  // Coppock
+  {
+    const cp = coppockValues(closes)
+    const v = last(cp), pv = prev(cp)
+    if (v != null && pv != null) {
+      if (v > 0 && pv <= 0) signals.push({ name: 'Coppock', signal: 'bullish' })
+      else if (v < 0) signals.push({ name: 'Coppock', signal: 'bearish' })
+      else signals.push({ name: 'Coppock', signal: 'neutral' })
+    }
+  }
+
+  // SMI
+  {
+    const { smi: smiData, signal: smiSig } = smiValues(highs, lows, closes)
+    const vSmi = last(smiData), vSig = last(smiSig)
+    if (vSmi != null && vSig != null) {
+      if (vSmi > vSig && vSmi > 0) signals.push({ name: 'SMI', signal: 'bullish' })
+      else if (vSmi < vSig && vSmi < 0) signals.push({ name: 'SMI', signal: 'bearish' })
+      else signals.push({ name: 'SMI', signal: 'oscillating' })
+    }
+  }
+
+  // AO
+  {
+    const ao = aoValues(highs, lows)
+    const v = last(ao), pv = prev(ao)
+    if (v != null && pv != null) {
+      if (v > 0 && v > pv) signals.push({ name: 'AO', signal: 'bullish' })
+      else if (v < 0 && v < pv) signals.push({ name: 'AO', signal: 'bearish' })
+      else if (v > 0 && v < pv) signals.push({ name: 'AO', signal: 'oscillating' })
+      else signals.push({ name: 'AO', signal: 'neutral' })
+    }
+  }
+
+  // ── Volume indicators ──
+
+  // OBV
+  {
+    const obv = obvValues(closes, vols)
+    const v = last(obv), pv = prev(obv)
+    if (v != null && pv != null) {
+      if (v > pv) signals.push({ name: 'OBV', signal: 'bullish' })
+      else if (v < pv) signals.push({ name: 'OBV', signal: 'bearish' })
+      else signals.push({ name: 'OBV', signal: 'neutral' })
+    }
+  }
+
+  // MFI
+  {
+    const mfi = mfiValues(highs, lows, closes, vols, 14)
+    const v = last(mfi)
+    if (v != null) {
+      if (v > 80) signals.push({ name: 'MFI', signal: 'oscillating' })
+      else if (v < 20) signals.push({ name: 'MFI', signal: 'oscillating' })
+      else if (v > 50) signals.push({ name: 'MFI', signal: 'bullish' })
+      else signals.push({ name: 'MFI', signal: 'bearish' })
+    }
+  }
+
+  // CMF
+  {
+    const cmf = cmfValues(highs, lows, closes, vols, 20)
+    const v = last(cmf)
+    if (v != null) {
+      if (v > 0.05) signals.push({ name: 'CMF', signal: 'bullish' })
+      else if (v < -0.05) signals.push({ name: 'CMF', signal: 'bearish' })
+      else signals.push({ name: 'CMF', signal: 'oscillating' })
+    }
+  }
+
+  // A/D
+  {
+    const ad = adValues(highs, lows, closes, vols)
+    const v = last(ad), pv = prev(ad)
+    if (v != null && pv != null) {
+      if (v > pv) signals.push({ name: 'A/D', signal: 'bullish' })
+      else if (v < pv) signals.push({ name: 'A/D', signal: 'bearish' })
+      else signals.push({ name: 'A/D', signal: 'neutral' })
+    }
+  }
+
+  // ForceIndex
+  {
+    const fi = forceIndexValues(closes, vols, 13)
+    const v = last(fi)
+    if (v != null) {
+      if (v > 0) signals.push({ name: 'FI', signal: 'bullish' })
+      else if (v < 0) signals.push({ name: 'FI', signal: 'bearish' })
+      else signals.push({ name: 'FI', signal: 'neutral' })
+    }
+  }
+
+  // ChaikinOsc
+  {
+    const co = chaikinOscValues(highs, lows, closes, vols, 3, 10)
+    const v = last(co), pv = prev(co)
+    if (v != null && pv != null) {
+      if (v > 0 && v > pv) signals.push({ name: 'ChaikinOsc', signal: 'bullish' })
+      else if (v < 0 && v < pv) signals.push({ name: 'ChaikinOsc', signal: 'bearish' })
+      else signals.push({ name: 'ChaikinOsc', signal: 'oscillating' })
+    }
+  }
+
+  // ── Volatility indicators ──
+
+  // ATR
+  {
+    const atr = atrValues(highs, lows, closes, 14)
+    const v = last(atr), pv = prev(atr)
+    if (v != null && pv != null) {
+      if (v > pv) signals.push({ name: 'ATR', signal: 'oscillating' })
+      else signals.push({ name: 'ATR', signal: 'neutral' })
+    }
+  }
+
+  // CHOP
+  {
+    const chop = chopValues(highs, lows, closes, 14)
+    const v = last(chop)
+    if (v != null) {
+      if (v > 61.8) signals.push({ name: 'CHOP', signal: 'oscillating' })
+      else signals.push({ name: 'CHOP', signal: 'neutral' })
+    }
+  }
+
+  // MassIndex
+  {
+    const mi = massIndexValues(highs, lows)
+    const th = massAdaptiveThresholds(mi)
+    const v = last(mi), pv = prev(mi)
+    if (v != null && pv != null) {
+      // 自适应阈值：越过进入线后跌破离开线才算反转确认（与主图竖带同口径）
+      if (pv >= th.enter && v < th.exit) signals.push({ name: 'MassIndex', signal: 'bullish' })
+      else signals.push({ name: 'MassIndex', signal: 'neutral' })
+    }
+  }
+
+  // UlcerIndex
+  {
+    const ui = ulcerIndexValues(closes)
+    const v = last(ui)
+    if (v != null) {
+      if (v < 5) signals.push({ name: 'UlcerIndex', signal: 'bullish' })
+      else if (v > 15) signals.push({ name: 'UlcerIndex', signal: 'bearish' })
+      else signals.push({ name: 'UlcerIndex', signal: 'neutral' })
+    }
+  }
+
+  // TTMSqueeze
+  {
+    const { squeeze, momentum } = ttmSqueezeValues(highs, lows, closes)
+    const sq = last(squeeze), mo = last(momentum), pMo = prev(momentum)
+    if (sq != null && mo != null) {
+      if (!sq && mo > 0) signals.push({ name: 'TTM', signal: 'bullish' })
+      else if (!sq && mo < 0) signals.push({ name: 'TTM', signal: 'bearish' })
+      else if (sq) signals.push({ name: 'TTM', signal: 'oscillating' })
+      else signals.push({ name: 'TTM', signal: 'neutral' })
+    }
+  }
+
+  // ElderRay
+  {
+    const { bullPower, bearPower } = elderRayValues(highs, lows, closes, 13)
+    const bP = last(bullPower), brP = last(bearPower)
+    if (bP != null && brP != null) {
+      if (bP > 0 && bP > brP) signals.push({ name: 'ElderRay', signal: 'bullish' })
+      else if (brP < 0 && brP < bP) signals.push({ name: 'ElderRay', signal: 'bearish' })
+      else signals.push({ name: 'ElderRay', signal: 'oscillating' })
+    }
+  }
+
+  return signals
+}
+
+const indicatorSignalSummary = computed(() => {
+  // 依赖 mergedRawRowsVersion 以感知 mergedRawRows 变更
+  void mergedRawRowsVersion.value
+  // 根据 hoverRawRow 计算当前光标对应的 K 线索引
+  const hoveredRow = hoverRawRow.value
+  let endIdx = null
+  if (hoveredRow) {
+    const curDay = String(hoveredRow.day || '').replace(/\//g, '-')
+    const idx = mergedRawRows.findIndex(x => String(x.day || '').replace(/\//g, '-') === curDay)
+    if (idx >= 0) endIdx = idx
+  }
+  const sigs = evaluateIndicatorSignals(endIdx)
+  if (!sigs.length) return null
+  const counts = { bullish: 0, bearish: 0, neutral: 0, oscillating: 0 }
+  for (const s of sigs) {
+    if (counts[s.signal] !== undefined) counts[s.signal]++
+  }
+  const total = sigs.length
+  return {
+    total,
+    bullish: counts.bullish,
+    bearish: counts.bearish,
+    neutral: counts.neutral,
+    oscillating: counts.oscillating,
+    bullishPct: total > 0 ? Math.round((counts.bullish / total) * 100) : 0,
+    bearishPct: total > 0 ? Math.round((counts.bearish / total) * 100) : 0,
+    neutralPct: total > 0 ? Math.round((counts.neutral / total) * 100) : 0,
+    oscillatingPct: total > 0 ? Math.round((counts.oscillating / total) * 100) : 0,
+    signals: sigs,
   }
 })
 
@@ -2115,6 +3375,7 @@ function longPaneLocalYFromClient(clientY) {
 }
 
 function refreshLongPriceLineCursorFromCrosshair(param) {
+  if (waveDragActive) return              // 波浪拖拽优先，不抢光标
   const paneEl = getLongDragPaneElement()
   if (!paneEl) return
   if (longPositionDragActive) {
@@ -2136,6 +3397,7 @@ function refreshLongPriceLineCursorFromCrosshair(param) {
 
 function clearLongPriceLinePaneCursor() {
   if (longPositionDragActive) return
+  if (waveDragActive) return
   const paneEl = getLongDragPaneElement()
   if (paneEl) paneEl.style.cursor = ''
 }
@@ -2304,6 +3566,1075 @@ function toggleLongPosition() {
     clearLongPriceLinePaneCursor()
   }
   syncLongPositionPriceLines()
+}
+
+// ===== 「测量」画框：两点画矩形，显示涨跌幅% / 价差 / K线数 / 成交量（支持多框）=====
+
+function toggleMeasure() {
+  // 互斥：开启测量时关闭波浪（直接操作状态，避免递归调用 toggleWave）
+  if (!showMeasure.value && showWave.value) {
+    showWave.value = false
+    clearAllWave()
+    detachWaveKeydown()
+  }
+  showMeasure.value = !showMeasure.value
+  if (!showMeasure.value) {
+    clearAllMeasure()
+    detachMeasureKeydown()
+  } else {
+    ensureMeasurePrimitive()
+    attachMeasureKeydown()
+  }
+}
+
+function ensureMeasurePrimitive() {
+  if (measurePrimitive || !candleSeries) return
+  measurePrimitive = createMeasurePrimitive(candleSeries)
+  // chart 重建后恢复已完成框
+  if (measureShapes.value.length > 0) {
+    measurePrimitive.setShapes(measureShapes.value)
+  }
+}
+
+/** VPVR 数据 getter：带版本缓存，primitive 每次 update 只做切片+分桶（避免每帧重排序） */
+function getVolumeProfileBars() {
+  if (volumeProfileBarsCache.version !== mergedRawRowsVersion.value) {
+    volumeProfileBarsCache.data = extractOHLCV(mergedRawRows)
+    volumeProfileBarsCache.version = mergedRawRowsVersion.value
+  }
+  return volumeProfileBarsCache.data
+}
+
+/** 移除价格刻度上的 POC 数值标签 */
+function clearPocPriceLine() {
+  if (pocTagRaf) {
+    cancelAnimationFrame(pocTagRaf)
+    pocTagRaf = 0
+  }
+  if (pocPriceLineHandle && candleSeries) {
+    try { candleSeries.removePriceLine(pocPriceLineHandle) } catch { /* ignore */ }
+  }
+  pocPriceLineHandle = null
+}
+
+/** 把当前 POC 价格同步到价格刻度；price 为 null 表示当前无 POC（无数据或可见区间为空） */
+function applyPocPriceLine(price) {
+  if (!candleSeries) return
+  if (price == null) {
+    clearPocPriceLine()
+    return
+  }
+  if (pocPriceLineHandle) {
+    pocPriceLineHandle.applyOptions({ price })
+    return
+  }
+  pocPriceLineHandle = candleSeries.createPriceLine({
+    price,
+    color: POC_COLOR,
+    lineWidth: 1,
+    lineStyle: LineStyle.Dashed,
+    // 横向虚线由 volumeProfilePrimitive 绘制，这里只要刻度上那枚 POC 数值标签
+    lineVisible: false,
+    axisLabelVisible: true,
+    title: 'POC',
+  })
+}
+
+/** primitive 在图表绘制周期内回调，延到下一帧再动价格线，避免在绘制过程中改图 */
+function onPocPriceChange(price) {
+  if (pocTagRaf) cancelAnimationFrame(pocTagRaf)
+  pocTagRaf = requestAnimationFrame(() => {
+    pocTagRaf = 0
+    applyPocPriceLine(price)
+  })
+}
+
+function ensureVolumeProfilePrimitive() {
+  if (volumeProfilePrimitive || !candleSeries) return
+  volumeProfilePrimitive = createVolumeProfilePrimitive(candleSeries, getVolumeProfileBars, onPocPriceChange)
+}
+
+/** 按开关状态挂载/卸载成交量分布 primitive（开关点击与指标重建两条路径都走这里） */
+function syncVolumeProfilePrimitive() {
+  if (showVolumeProfile.value) {
+    ensureVolumeProfilePrimitive()
+    volumeProfilePrimitive?.requestRedraw()
+  } else {
+    if (volumeProfilePrimitive && candleSeries) {
+      try { candleSeries.detachPrimitive(volumeProfilePrimitive) } catch { /* ignore */ }
+    }
+    volumeProfilePrimitive = null
+    clearPocPriceLine()
+  }
+}
+
+// ===== 神奇九转 TD Sequential =====
+
+/** 九转 OHLCV getter：带版本缓存 */
+function getTDSequentialBars() {
+  if (tdSequentialBarsCache.version !== mergedRawRowsVersion.value) {
+    tdSequentialBarsCache.data = extractOHLCV(mergedRawRows)
+    tdSequentialBarsCache.version = mergedRawRowsVersion.value
+  }
+  return tdSequentialBarsCache.data
+}
+
+/** 九转计数 getter：带版本缓存（算法在 calc.ts） */
+function getTDSequentialCounts() {
+  if (tdSequentialCache.version !== mergedRawRowsVersion.value) {
+    const { closes } = extractOHLCV(mergedRawRows)
+    tdSequentialCache.counts = tdSequentialValues(closes)
+    tdSequentialCache.version = mergedRawRowsVersion.value
+  }
+  return tdSequentialCache.counts
+}
+
+function ensureTDSequentialPrimitive() {
+  if (tdSequentialPrimitive || !candleSeries) return
+  tdSequentialPrimitive = createTDSequentialPrimitive(candleSeries, getTDSequentialBars, getTDSequentialCounts)
+}
+
+/** 按开关状态挂载/卸载九转 primitive */
+function syncTDSequentialPrimitive() {
+  if (showTDSequential.value) {
+    ensureTDSequentialPrimitive()
+    tdSequentialPrimitive?.requestRedraw()
+  } else if (tdSequentialPrimitive) {
+    if (candleSeries) {
+      try { candleSeries.detachPrimitive(tdSequentialPrimitive) } catch { /* ignore */ }
+    }
+    tdSequentialPrimitive = null
+  }
+}
+
+// ===== Mass Index 反转窗口（主图叠加 primitive）=====
+
+/** Mass 反转窗口数据 getter：带版本缓存（times + Mass 序列） */
+function getMassZoneData() {
+  if (massZoneCache.version !== mergedRawRowsVersion.value) {
+    const { times, highs, lows } = extractOHLCV(mergedRawRows)
+    massZoneCache.data = { times, mass: massIndexValues(highs, lows) }
+    massZoneCache.version = mergedRawRowsVersion.value
+  }
+  return massZoneCache.data
+}
+
+function ensureMassZonePrimitive() {
+  if (massZonePrimitive || !candleSeries) return
+  massZonePrimitive = createMassZonePrimitive(candleSeries, getMassZoneData)
+}
+
+/** Mass 开启时在主图标注「凸起→回落」的反转窗口；关闭时卸载 */
+function syncMassZonePrimitive() {
+  if (showMassIndex.value) {
+    ensureMassZonePrimitive()
+    massZonePrimitive?.requestRedraw()
+  } else if (massZonePrimitive) {
+    if (candleSeries) {
+      try { candleSeries.detachPrimitive(massZonePrimitive) } catch { /* ignore */ }
+    }
+    massZonePrimitive = null
+  }
+}
+
+// ===== BBI 多空指标（主图叠加线）=====
+
+function clearBBISeries() {
+  if (bbiSeries) {
+    try { chart?.removeSeries(bbiSeries) } catch { /* ignore */ }
+    bbiSeries = null
+  }
+}
+
+function syncBBISeries() {
+  clearBBISeries()
+  if (!showBBI.value || !chart || !candleSeries) return
+  const { times, closes } = extractOHLCV(mergedRawRows)
+  const bbi = bbiValues(closes)
+  bbiSeries = chart.addSeries(LineSeries, {
+    color: '#f0b90b',
+    lineWidth: 2,
+    priceLineVisible: false,
+    lastValueVisible: false,
+    title: 'BBI',
+    // 叠加主图：与 K 线同 pane、同价格刻度
+    pane: 0,
+    overlay: true,
+  })
+  const data = []
+  for (let i = 0; i < times.length; i++) {
+    if (bbi[i] != null) data.push({ time: times[i], value: bbi[i] })
+  }
+  bbiSeries.setData(data)
+}
+
+// ===== 涨跌停价位线 =====
+
+/**
+ * 按股票代码/名称/历史行情推断 A 股涨跌幅档位；非 A 股个股（港美股/指数等）返回 null 不画线。
+ * 多信号判定（代码档位为基础，ST 5% 档三信号互补）：
+ * 1. 代码段：创业板/科创板 20%、北交所 30%（ST 同档，无 5% 之说）
+ * 2. 名称含 ST（宽松匹配：忽略空格/*号/大小写，兼容 "ST"、"*ST"、"S*ST" 及带空格变体）
+ * 3. 行情实证 limitBandEvidence.recentRegime（只认最近 10 个交易日的档位指示日）：
+ *    - 'notSt'：近10日出现 >5.6% 极值或精确触及 10% 帽 → 当前绝非 ST（纠正摘帽后名称滞后）；
+ *      注意不能用全历史极值反证——ST 股戴帽前的旧 10% 波动日永远留在 K 线窗口里，
+ *      曾因此把名称明明是 ST 的股误判成 +10%（用户实测踩坑）
+ *    - 'st'：近10日精确触及 5% 帽（ST 涨停/跌停价）→ ST 铁证
+ *    - 无名称时的兜底：全窗（除权日已剔除）从未超 ±5.6% 且反复贴 5% 帽 → ST 签名
+ */
+function inferLimitPct(evidence) {
+  // 注意 prop 名是 code（非 stockCode）；组件收到的代码为后缀格式（600519.SH / 000001.SZ / 00700.HK）或前缀格式（sh600519）
+  const code = String(props.code || '').toUpperCase()
+  if (!code) return null
+  // 港股 / 中证指数 / 海外指数 / 美股 / 币安合约 / 美股永续 / OKX：无 A 股涨跌停概念
+  if (isHkCode.value || isCsiIndexCode.value || isGlobalIndexCode.value || isBinanceCode.value || isBitgetCode.value || isOKXCode.value) return null
+  if (code.endsWith('.US') || code.startsWith('US')) return null
+  // 提取数字部分（兼容 600519.SH / sh600519 / 600519 等）
+  const digits = code.replace(/[^\d]/g, '')
+  if (digits.length < 6) return null
+  const pure = digits.slice(-6)
+  // 指数不画线：沪市 000 段是指数（000001.SH 上证指数，注意与深市个股 000001.SZ 平安银行区分）；深市 399 段全为指数
+  const isSH = code.endsWith('.SH') || code.startsWith('SH')
+  if ((isSH && pure.startsWith('000')) || pure.startsWith('399')) return null
+  // 创业板(30x)/科创板(68x) ±20%（ST 同样 20%）；北交所(8x/4x/920) ±30%
+  if (/^(30|68)/.test(pure)) return 0.20
+  if (/^(8|4|92)/.test(pure)) return 0.30
+  // ===== 沪深主板：10% vs ST 5% =====
+  const rawName = String(props.stockName || '')
+  const hasName = rawName.trim() !== ''
+  // 宽松 ST 匹配：去掉所有空格和 * 号后，前缀为 ST 或 SST（覆盖 ST / *ST / S*ST / * ST / S ST 等变体）
+  const nameSt = /^S?ST/i.test(rawName.replace(/[\s*]/g, ''))
+  const ev = evidence || { days: 0, maxExt: 0, stCaps: 0, recentRegime: null }
+  if (nameSt) {
+    // 仅当最近 10 个交易日内出现 >5.6% 极值/触及 10% 帽才反证（ST 任何一天都不可能超 5.6%，
+    // 越近的大波动日才能证明「当前」非 ST；戴帽前的旧 10% 波动日不作数）
+    if (ev.recentRegime === 'notSt') return 0.10
+    return 0.05
+  }
+  // 名称缺失时的数据正证：近10日精确触及 5% 帽，或全窗从未超 ±5.6% 且反复贴 5% 帽（排除长期停牌：maxExt≥2%）
+  if (!hasName) {
+    if (ev.recentRegime === 'st') return 0.05
+    if (ev.days >= 20 && ev.maxExt >= 0.02 && ev.maxExt <= 0.056 && ev.stCaps >= 2) return 0.05
+  }
+  return 0.10 // 沪深主板
+}
+
+function clearLimitPriceLines() {
+  if (limitPriceLineHandles.length === 0) return
+  if (candleSeries) {
+    for (const pl of limitPriceLineHandles) {
+      try { candleSeries.removePriceLine(pl) } catch { /* ignore */ }
+    }
+  }
+  limitPriceLineHandles = []
+}
+
+function syncLimitPriceLines() {
+  clearLimitPriceLines()
+  if (!showLimitLines.value || !candleSeries) return
+  // 涨跌停是「日级」概念：仅分时与日K绘制；周/月/季/年K的"前一根收盘"是上周期末价，算出来的是上周期首日的涨跌停，无意义
+  if (DAILY_LIKE_KLT.has(activeKlt.value) && activeKlt.value !== '101') return
+  const { times, opens, closes, highs, lows } = extractOHLCV(mergedRawRows)
+  // 行情实证（ST 档位的数据信号，与名称信号互补；opens 用于剔除除权日）
+  const evidence = limitBandEvidence(times, highs, lows, closes, opens)
+  const pct = inferLimitPct(evidence)
+  if (pct == null) return
+  const { limitUp, limitDown, prevClose } = limitPriceLines(closes, times, pct)
+  if (limitUp == null || limitDown == null) return
+  const pctLabel = Math.round(pct * 100)
+  const lines = [
+    { price: limitUp, color: '#ef4444', title: `涨停 ${formatPrice2(limitUp)}（昨收 ${formatPrice2(prevClose)} · ${pctLabel}%）`, style: LineStyle.Dashed, w: 1 },
+    { price: limitDown, color: '#22c55e', title: `跌停 ${formatPrice2(limitDown)}（昨收 ${formatPrice2(prevClose)} · ${pctLabel}%）`, style: LineStyle.Dashed, w: 1 },
+  ]
+  for (const l of lines) {
+    const pl = candleSeries.createPriceLine({
+      price: l.price,
+      color: l.color,
+      lineWidth: l.w,
+      lineStyle: l.style,
+      axisLabelVisible: true,
+      title: l.title,
+    })
+    limitPriceLineHandles.push(pl)
+  }
+}
+
+// ===== 自动背离 Divergence =====
+
+/** 背离 OHLCV getter：带版本缓存 */
+function getDivergenceBars() {
+  if (divergenceBarsCache.version !== mergedRawRowsVersion.value) {
+    divergenceBarsCache.data = extractOHLCV(mergedRawRows)
+    divergenceBarsCache.version = mergedRawRowsVersion.value
+  }
+  return divergenceBarsCache.data
+}
+
+/**
+ * 背离检测 getter：带版本+指标源缓存
+ * 指标源：rsi(14) / macd(DIF) / kdj(K) —— 都是 A 股教材经典背离口径
+ */
+function getDivergenceData() {
+  const src = divergenceSource.value
+  if (divergenceCache.version === mergedRawRowsVersion.value && divergenceCache.source === src) {
+    return divergenceCache.data
+  }
+  const { closes, highs, lows } = extractOHLCV(mergedRawRows)
+  let indicator = null
+  // 注意 calc 返回结构：rsiBundle 直接返回数组；kdjBundle 返回 {K,D,J}（大写）；macdBundle 返回 {dif,dea,hist}
+  if (src === 'macd') {
+    indicator = macdBundle(closes).dif
+  } else if (src === 'kdj') {
+    indicator = kdjBundle(highs, lows, closes).K
+  } else {
+    indicator = rsiBundle(closes)
+  }
+  if (!indicator) return null
+  divergenceCache.data = divergenceValues(closes, indicator)
+  divergenceCache.version = mergedRawRowsVersion.value
+  divergenceCache.source = src
+  return divergenceCache.data
+}
+
+function ensureDivergencePrimitive() {
+  if (divergencePrimitive || !candleSeries) return
+  divergencePrimitive = createDivergencePrimitive(candleSeries, getDivergenceBars, getDivergenceData)
+}
+
+/** 按开关状态挂载/卸载背离 primitive */
+function syncDivergencePrimitive() {
+  if (showDivergence.value) {
+    ensureDivergencePrimitive()
+    divergencePrimitive?.requestRedraw()
+  } else if (divergencePrimitive) {
+    if (candleSeries) {
+      try { candleSeries.detachPrimitive(divergencePrimitive) } catch { /* ignore */ }
+    }
+    divergencePrimitive = null
+  }
+}
+
+// ===== Weis Wave（副图 histogram）走 syncSubPaneIndicators 的 subs 挂载体系，无需独立同步函数 =====
+
+// ===== 买卖点预测（多指标共振，主图箭头标注） =====
+
+/** 买卖点 OHLCV getter：带版本缓存 */
+function getBuySellBars() {
+  if (buySellBarsCache.version !== mergedRawRowsVersion.value) {
+    buySellBarsCache.data = extractOHLCV(mergedRawRows)
+    buySellBarsCache.version = mergedRawRowsVersion.value
+  }
+  return buySellBarsCache.data
+}
+
+/** 买卖点检测 getter：带版本+档位缓存（阈值或周期变化需重算） */
+function getBuySellData() {
+  const opt = BUY_SELL_SCORE_OPTIONS.find(o => o.value === buySellMinScore.value) || BUY_SELL_SCORE_OPTIONS[1]
+  const klt = activeKlt.value
+  if (
+    buySellCache.version === mergedRawRowsVersion.value
+    && buySellCache.score === opt.minScore
+    && buySellCache.klt === klt
+  ) {
+    return buySellCache.data
+  }
+  const { highs, lows, closes, vols, days } = getBuySellBars()
+  buySellCache.data = buySellPointsValues(highs, lows, closes, vols, {
+    minScore: opt.minScore,
+    minGroups: opt.minGroups,
+    dayKeys: days,
+    intraday: !DAILY_LIKE_KLT.has(klt),
+  })
+  buySellCache.version = mergedRawRowsVersion.value
+  buySellCache.score = opt.minScore
+  buySellCache.klt = klt
+  return buySellCache.data
+}
+
+function ensureBuySellPrimitive() {
+  if (buySellPrimitive || !candleSeries) return
+  buySellPrimitive = createBuySellPrimitive(candleSeries, getBuySellBars, getBuySellData)
+}
+
+// ===== 买卖点提示音 =====
+// 音频合成与 AudioContext 已抽到 kline/alertSound.ts，与后台信号监控引擎共享同一实例
+// （引擎在 kline/signalMonitor.ts 中统一裁决，避免同一只票响两次）。
+
+/**
+ * 用户手势内预热音频上下文。
+ * 必要：若「买卖点」是上次持久化开启的，本次进入页面没有点击手势，浏览器自动播放策略
+ * 会让后续轮询触发的响铃静默失效。
+ * 不「用后即注销」：系统休眠唤醒、音频设备切换后上下文可能重新变 suspended，
+ * 保留监听才能在每次手势时自动恢复。
+ */
+function primeAlertAudioOnGesture() {
+  primeAlertAudio()
+}
+
+/**
+ * 试听后的就绪自检：稍等音频上下文状态落定，若仍不是 running 就提示一句。
+ * 自动播放策略在无手势时会把上下文挂起，这种「静音失败」必须让用户看见，
+ * 否则只会以为提示音坏了。300ms 是等 resume() 的 Promise 落定，避免误报。
+ */
+function warnIfAudioNotReady(name) {
+  setTimeout(() => {
+    const st = alertAudioState()
+    if (st === 'running') return
+    message.warning(
+      `${name}试听无声：音频未就绪（${st}）。请先点击窗口内任意位置再试听；`
+      + '若仍无声，请检查系统音量与「音量合成器」中本应用的音量。',
+    )
+  }, 300)
+}
+
+/**
+ * 检测是否出现「新的」买卖点并播报提示音。
+ * 只在「买卖点」开启时评估；首次评估、换股/切周期/换档位只重置基线不响铃；
+ * 同一批历史箭头不会因轮询刷新、重绘或向左加载更多历史而重复播报。
+ */
+function checkBuySellAlert(data) {
+  if (!data || typeof data !== 'object') return
+  const { times } = getBuySellBars()
+  // 信号身份取所在 K 线的时间（Unix 秒，唯一且可比较，且不受加载更早历史导致的位移影响）
+  const latestTime = (arr) => {
+    for (let k = arr.length - 1; k >= 0; k--) {
+      const t = times[arr[k].i]
+      if (typeof t === 'number') return t
+    }
+    return null
+  }
+  const buyTime = latestTime(data.buys)
+  const sellTime = latestTime(data.sells)
+  const ctx = `${props.code}|${activeKlt.value}|${buySellMinScore.value}`
+  if (!buySellAlertState.ready || buySellAlertState.ctx !== ctx) {
+    buySellAlertState.ready = true
+    buySellAlertState.ctx = ctx
+    buySellAlertState.buy = buyTime
+    buySellAlertState.sell = sellTime
+    return
+  }
+  // 仅当最新信号时间晚于上次基线才算新信号：信号回撤（最新箭头消失）或加载更早历史都不会触发
+  const newerThan = (t, base) => t != null && (base == null || t > base)
+  const hasNewBuy = newerThan(buyTime, buySellAlertState.buy)
+  const hasNewSell = newerThan(sellTime, buySellAlertState.sell)
+  if (hasNewBuy) buySellAlertState.buy = buyTime
+  if (hasNewSell) buySellAlertState.sell = sellTime
+  if (!hasNewBuy && !hasNewSell) return
+  if (!buySellAlertSound.value) return
+  // 后台监控若已抢先响过同一根 K 线的同向信号，这里就不再重复（先判开关再抢占，见 alertSound.ts）
+  const claimedBuy = hasNewBuy && claimAlertToneOnce(`${ctx}|bs|buy|${buyTime}`)
+  const claimedSell = hasNewSell && claimAlertToneOnce(`${ctx}|bs|sell|${sellTime}`)
+  if (!claimedBuy && !claimedSell) return
+  playBuySellAlertTone(claimedBuy && claimedSell ? 'both' : claimedBuy ? 'buy' : 'sell')
+}
+
+/** 按开关状态挂载/卸载买卖点 primitive */
+function syncBuySellPrimitive() {
+  if (showBuySell.value) {
+    ensureBuySellPrimitive()
+    buySellPrimitive?.requestRedraw()
+    // 数据刷新（轮询/换股/切周期）后评估是否出现新信号；首次评估只记基线
+    checkBuySellAlert(getBuySellData())
+    return
+  }
+  if (buySellPrimitive) {
+    if (candleSeries) {
+      try { candleSeries.detachPrimitive(buySellPrimitive) } catch { /* ignore */ }
+    }
+    buySellPrimitive = null
+  }
+  // 关闭后重新开启时重新建立基线，不补播历史上已存在的箭头
+  buySellAlertState.ready = false
+}
+
+// ===== TEMA 斜率转折（独立买卖点标注，与 14 路共振体系互不影响） =====
+
+/** TEMA 转折点检测 getter：带版本+周期缓存（复用买卖点体系的 OHLCV 提取缓存） */
+function getTemaTurnData() {
+  const klt = activeKlt.value
+  if (
+    temaTurnCache.version === mergedRawRowsVersion.value
+    && temaTurnCache.klt === klt
+  ) {
+    return temaTurnCache.data
+  }
+  const { highs, lows, closes } = getBuySellBars()
+  temaTurnCache.data = temaTurnPointsValues(highs, lows, closes, {
+    intraday: !DAILY_LIKE_KLT.has(klt),
+  })
+  temaTurnCache.version = mergedRawRowsVersion.value
+  temaTurnCache.klt = klt
+  return temaTurnCache.data
+}
+
+function ensureTemaTurnPrimitive() {
+  if (temaTurnPrimitive || !candleSeries) return
+  temaTurnPrimitive = createTemaTurnPrimitive(candleSeries, getBuySellBars, getTemaTurnData)
+}
+
+/**
+ * 检测是否出现新的「T确」（TEMA 温和确认）信号并播报提示音。
+ * 只对 kind==='conf' 生效：T预(预警)、T强(急速买)、T急(急速卖) 不响铃；
+ * 首次评估与换股/切周期只重置基线不响铃（历史标记不补播）。
+ */
+function checkTemaTurnAlert(data) {
+  if (!data || typeof data !== 'object') return
+  const { times } = getBuySellBars()
+  // 从末尾取最新一个「确认」点的时间；kind==='impulse' 是升级后的确认点（标签为 T强/T急）不计入
+  const latestConfTime = (arr) => {
+    for (let k = arr.length - 1; k >= 0; k--) {
+      if (arr[k].kind !== 'conf') continue
+      const t = times[arr[k].i]
+      if (typeof t === 'number') return t
+    }
+    return null
+  }
+  const buyTime = latestConfTime(data.buys)
+  const sellTime = latestConfTime(data.sells)
+  const ctx = `${props.code}|${activeKlt.value}`
+  if (!temaTurnAlertState.ready || temaTurnAlertState.ctx !== ctx) {
+    temaTurnAlertState.ready = true
+    temaTurnAlertState.ctx = ctx
+    temaTurnAlertState.buy = buyTime
+    temaTurnAlertState.sell = sellTime
+    return
+  }
+  const newerThan = (t, base) => t != null && (base == null || t > base)
+  const hasNewBuy = newerThan(buyTime, temaTurnAlertState.buy)
+  const hasNewSell = newerThan(sellTime, temaTurnAlertState.sell)
+  if (hasNewBuy) temaTurnAlertState.buy = buyTime
+  if (hasNewSell) temaTurnAlertState.sell = sellTime
+  if (!hasNewBuy && !hasNewSell) return
+  if (!temaTurnAlertSound.value) return
+  // 与买卖点同一套全局去重：后台监控已响过的「T确」不重复响
+  const claimedBuy = hasNewBuy && claimAlertToneOnce(`${ctx}|tema|buy|${buyTime}`)
+  const claimedSell = hasNewSell && claimAlertToneOnce(`${ctx}|tema|sell|${sellTime}`)
+  if (!claimedBuy && !claimedSell) return
+  playTemaConfirmAlertTone(claimedBuy ? 'buy' : 'sell')
+}
+
+/** 按开关状态挂载/卸载 TEMA 转折 primitive */
+function syncTemaTurnPrimitive() {
+  if (showTemaTurn.value) {
+    ensureTemaTurnPrimitive()
+    temaTurnPrimitive?.requestRedraw()
+    // 数据刷新（轮询/换股/切周期）后评估是否出现新确认信号；首次评估只记基线
+    checkTemaTurnAlert(getTemaTurnData())
+    return
+  }
+  if (temaTurnPrimitive) {
+    if (candleSeries) {
+      try { candleSeries.detachPrimitive(temaTurnPrimitive) } catch { /* ignore */ }
+    }
+    temaTurnPrimitive = null
+  }
+  // 关闭后重新开启时重新建立基线，不补播历史上已存在的「T确」标记
+  temaTurnAlertState.ready = false
+}
+
+/** 清除当前正在画的预览框（保留已完成框） */
+function clearMeasure() {
+  measureP1.value = null
+  if (measurePrimitive) measurePrimitive.clearCurrent()
+}
+
+/** 清除所有测量框（切换股票/退出模式时调用） */
+function clearAllMeasure() {
+  measureP1.value = null
+  measureShapes.value = []
+  if (measurePrimitive) measurePrimitive.clearAll()
+}
+
+/** 撤销最后一个已完成框 */
+function undoLastMeasureShape() {
+  if (measureShapes.value.length === 0) return
+  measureShapes.value.pop()
+  if (measurePrimitive) measurePrimitive.removeLastShape()
+}
+
+/**
+ * 状态机（多框）：!p1 → 记 p1；否则 → 固定 p2、入列、重置开始画下一个
+ * ESC 清当前预览或撤销最后一个框；Ctrl+Z 撤销最后一个已完成框
+ */
+function handleMeasureClick(param) {
+  if (!param.point) return
+  if (param.paneIndex != null && param.paneIndex !== 0) return
+  if (param.time === undefined) return // 点击在 K 线数据范围外
+  // 取该 K 线收盘价（非鼠标精确价格），涨跌幅对应实际交易价
+  const bar = param.seriesData?.get(candleSeries)
+  const price = bar?.close == null ? NaN : Number(bar.close)
+  if (!Number.isFinite(price)) return
+  ensureMeasurePrimitive()
+  if (!measurePrimitive) return
+
+  if (!measureP1.value) {
+    // 记第一点
+    measureP1.value = { time: param.time, price }
+    measurePrimitive.setP1({ time: param.time, price })
+    measurePrimitive.setStats(null)
+  } else {
+    // 固定第二点：加入已完成列表，重置当前框开始画下一个
+    const finalP2 = { time: param.time, price }
+    const stats = computeMeasureStats(measureP1.value, finalP2)
+    const shape = { p1: measureP1.value, p2: finalP2, stats }
+    measureShapes.value.push(shape)
+    measurePrimitive.addShape(shape)
+    // 重置当前框，开始画下一个
+    measureP1.value = null
+    measurePrimitive.clearCurrent()
+  }
+}
+
+/** 实时预览：p1 已确定且未固定时，跟随十字线显示预览框 */
+function updateMeasurePreview(param) {
+  if (!showMeasure.value || !measureP1.value) return
+  if (!measurePrimitive) return
+  if (!param || !param.point || param.time === undefined) {
+    measurePrimitive.setP2(null)
+    return
+  }
+  // 取该 K 线收盘价，与点击基准一致
+  const bar = param.seriesData?.get(candleSeries)
+  const price = bar?.close == null ? NaN : Number(bar.close)
+  if (!Number.isFinite(price)) return
+  const previewP2 = { time: param.time, price }
+  measurePrimitive.setP2(previewP2)
+  measurePrimitive.setStats(computeMeasureStats(measureP1.value, previewP2))
+}
+
+/** 计算涨跌幅/价差/K线数/成交量（成交量从 mergedRawRows 累加） */
+function computeMeasureStats(p1, p2) {
+  if (!p1 || !p2) return null
+  const price1 = Number(p1.price)
+  const price2 = Number(p2.price)
+  if (!Number.isFinite(price1) || !Number.isFinite(price2) || price1 === 0) return null
+  const diff = price2 - price1
+  const pct = (diff / price1) * 100
+  // K 线 time 为 Unix 秒（number），直接数值比较
+  const lo = Math.min(p1.time, p2.time)
+  const hi = Math.max(p1.time, p2.time)
+  let barCount = 0
+  let volSum = 0
+  for (const r of mergedRawRows) {
+    const ct = toChartTime(r.day)
+    if (ct == null) continue
+    if (ct >= lo && ct <= hi) {
+      barCount++
+      const v = parseNumStr(r.volume)
+      if (Number.isFinite(v)) volSum += v
+    }
+  }
+  return { diff, pct, barCount, volSum }
+}
+
+function attachMeasureKeydown() {
+  if (measureKeydownHandler) return
+  measureKeydownHandler = (e) => {
+    if (!showMeasure.value) return
+    if (e.key === 'Escape') {
+      if (measureP1.value) {
+        clearMeasure()                       // 有正在画的框：清当前预览
+      } else if (measureShapes.value.length > 0) {
+        undoLastMeasureShape()               // 无正在画的框：撤销最后一个已完成框
+      } else {
+        toggleMeasure()                      // 无任何框：退出测量模式
+      }
+    } else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+      e.preventDefault()
+      undoLastMeasureShape()                 // Ctrl+Z 撤销最后一个已完成框
+    }
+  }
+  window.addEventListener('keydown', measureKeydownHandler, true)
+}
+
+function detachMeasureKeydown() {
+  if (measureKeydownHandler) {
+    window.removeEventListener('keydown', measureKeydownHandler, true)
+    measureKeydownHandler = null
+  }
+}
+
+// ===== 「波浪理论」绘图：两点选区，自动计算 5 浪 + 斐波那契回调 + 通道 + 浪号 =====
+
+function toggleWave() {
+  // 互斥：开启波浪时关闭绘图工具/测量
+  if (!showWave.value && drawingActiveTool.value) clearDrawingTool()
+  if (!showWave.value && showMeasure.value) {
+    showMeasure.value = false
+    clearAllMeasure()
+    detachMeasureKeydown()
+  }
+  showWave.value = !showWave.value
+  if (!showWave.value) {
+    clearAllWave()
+    detachWaveKeydown()
+  } else {
+    ensureWavePrimitive()
+    attachWaveKeydown()
+  }
+}
+
+function ensureWavePrimitive() {
+  if (wavePrimitive || !candleSeries) return
+  wavePrimitive = createWavePrimitive(candleSeries)
+  wavePrimitive.setMode(waveMode.value)
+  // chart 重建后恢复已完成波浪
+  if (waveShapes.value.length > 0) {
+    wavePrimitive.setShapes(waveShapes.value)
+  }
+}
+
+/** 清除当前正在画的预览波浪（保留已完成波浪） */
+function clearWave() {
+  waveP0.value = null
+  if (wavePrimitive) wavePrimitive.clearCurrent()
+}
+
+/** 清除所有波浪（切换股票/退出模式时调用） */
+function clearAllWave() {
+  if (waveDragActive) cancelWaveDrag()
+  waveP0.value = null
+  waveShapes.value = []
+  if (wavePrimitive) wavePrimitive.clearAll()
+}
+
+// ===== 绘图插件（lightweight-charts-drawing）：与波浪/测量共存，自实现 anchor 收集 =====
+
+/** 懒初始化 drawingHost（首次激活工具时创建，避免无谓开销） */
+function ensureDrawingHost() {
+  if (drawingHost || !chart || !candleSeries || !chartContainerRef.value) return
+  drawingHost = createDrawingHost(
+    { chart, series: candleSeries, container: chartContainerRef.value },
+    {
+      // 收集锚点中途提示：还需点击几个点
+      onProgress: ({ collected, required }) => {
+        if (collected < required) {
+          message.info(`已选 ${collected}/${required} 个锚点，还需点击 ${required - collected} 个`)
+        }
+      },
+    },
+  )
+  // 监听 drawing 增删，同步计数（清空按钮显示用）
+  drawingHost.on('drawing:added', () => { drawingTotalCount.value = drawingHost.getDrawingsCount() })
+  drawingHost.on('drawing:removed', () => { drawingTotalCount.value = drawingHost.getDrawingsCount() })
+  drawingHost.on('drawing:cleared', () => { drawingTotalCount.value = 0 })
+}
+
+/**
+ * 激活某个绘图工具（互斥关闭测量/波浪）。
+ * 同 key 再点一次 → 取消当前工具。
+ */
+function setActiveDrawingTool(toolKey) {
+  // 互斥：关闭测量/波浪
+  if (showMeasure.value) { showMeasure.value = false; clearAllMeasure(); detachMeasureKeydown() }
+  if (showWave.value) { showWave.value = false; clearAllWave(); detachWaveKeydown() }
+  if (drawingActiveTool.value === toolKey) {
+    clearDrawingTool()                      // 同 key 再点 → 取消
+    return
+  }
+  ensureDrawingHost()
+  if (!drawingHost) return
+  drawingHost.setActiveTool(toolKey)
+  drawingActiveTool.value = toolKey
+  attachDrawingKeydown()
+  const paneEl = getLongDragPaneElement()
+  if (paneEl) paneEl.style.cursor = 'crosshair'
+}
+
+/** 取消当前绘图工具（不删已完成 drawing） */
+function clearDrawingTool() {
+  if (drawingHost) drawingHost.cancelActive()
+  drawingActiveTool.value = null
+  detachDrawingKeydown()
+  const paneEl = getLongDragPaneElement()
+  if (paneEl) paneEl.style.cursor = ''
+}
+
+/** 撤销最后一个绘图 */
+function undoLastDrawing() {
+  if (drawingHost) drawingHost.undoLast()
+}
+
+/** 清空所有绘图 */
+function clearAllDrawings() {
+  if (drawingHost) drawingHost.clearAll()
+  drawingTotalCount.value = 0
+}
+
+/** 挂接绘图 ESC/Ctrl+Z 监听 */
+function attachDrawingKeydown() {
+  if (drawingKeydownHandler) return
+  drawingKeydownHandler = (e) => {
+    if (!drawingActiveTool.value) return
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      if (drawingHost && drawingHost.getDrawingsCount() > 0) {
+        // 有已完成绘图：ESC 先清空（参照 wave 范式）
+        clearAllDrawings()
+      } else {
+        // 无绘图：ESC 退出工具
+        clearDrawingTool()
+      }
+    } else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+      e.preventDefault()
+      undoLastDrawing()
+    }
+  }
+  window.addEventListener('keydown', drawingKeydownHandler, true)
+}
+
+/** 卸载绘图 ESC/Ctrl+Z 监听 */
+function detachDrawingKeydown() {
+  if (!drawingKeydownHandler) return
+  window.removeEventListener('keydown', drawingKeydownHandler, true)
+  drawingKeydownHandler = null
+}
+
+/** NDropdown 选项：按 group 分组成子菜单 */
+const drawingToolOptions = computed(() => {
+  const groups = []
+  const groupMap = new Map()
+  for (const t of DRAWING_TOOLS) {
+    let g = groupMap.get(t.group)
+    if (!g) {
+      g = { label: t.group, key: `group-${t.group}`, children: [] }
+      groupMap.set(t.group, g)
+      groups.push(g)
+    }
+    g.children.push({ label: `${t.label}（${t.anchors}点）`, key: t.key })
+  }
+  return groups
+})
+
+/** 当前激活工具的显示文案（按钮上显示） */
+const drawingActiveToolLabel = computed(() => {
+  if (!drawingActiveTool.value) return '绘图'
+  const t = DRAWING_TOOLS.find(d => d.key === drawingActiveTool.value)
+  return t ? t.label : '绘图'
+})
+
+/** NDropdown select 回调 */
+function onDrawingToolSelect(key) {
+  if (key && key.startsWith('group-')) return   // 分组标题不响应
+  setActiveDrawingTool(key)
+}
+
+/** 撤销最后一个已完成波浪 */
+function undoLastWaveShape() {
+  if (waveShapes.value.length === 0) return
+  waveShapes.value.pop()
+  if (wavePrimitive) wavePrimitive.removeLastShape()
+}
+
+/**
+ * 状态机（多波浪）：!p0 → 记 p0；否则 → 固定 p5、入列、重置开始画下一个
+ * ESC 清当前预览或撤销最后一个波浪；Ctrl+Z 撤销最后一个已完成波浪
+ */
+function handleWaveClick(param) {
+  if (!param.point) return
+  if (param.paneIndex != null && param.paneIndex !== 0) return
+  if (param.time === undefined) return // 点击在 K 线数据范围外
+  // 取该 K 线收盘价（非鼠标精确价格），与测量工具一致
+  const bar = param.seriesData?.get(candleSeries)
+  const price = bar?.close == null ? NaN : Number(bar.close)
+  if (!Number.isFinite(price)) return
+  ensureWavePrimitive()
+  if (!wavePrimitive) return
+
+  if (!waveP0.value) {
+    // 记起点 p0
+    waveP0.value = { time: param.time, price }
+    wavePrimitive.setP0({ time: param.time, price })
+  } else {
+    // 固定终点 p5：加入已完成列表，重置当前波浪开始画下一个
+    const finalP5 = { time: param.time, price }
+    const shape = { p0: waveP0.value, p5: finalP5, mode: waveMode.value }
+    waveShapes.value.push(shape)
+    wavePrimitive.addShape(shape)
+    // 重置当前波浪，开始画下一个
+    waveP0.value = null
+    wavePrimitive.clearCurrent()
+  }
+}
+
+/** 实时预览：p0 已确定且未固定时，跟随十字线显示预览波浪 */
+function updateWavePreview(param) {
+  if (!showWave.value || !waveP0.value) return
+  if (!wavePrimitive) return
+  if (!param || !param.point || param.time === undefined) {
+    wavePrimitive.setP5(null)
+    return
+  }
+  // 取该 K 线收盘价，与点击基准一致
+  const bar = param.seriesData?.get(candleSeries)
+  const price = bar?.close == null ? NaN : Number(bar.close)
+  if (!Number.isFinite(price)) return
+  const previewP5 = { time: param.time, price }
+  wavePrimitive.setP5(previewP5)
+}
+
+function attachWaveKeydown() {
+  if (waveKeydownHandler) return
+  waveKeydownHandler = (e) => {
+    if (!showWave.value) return
+    // 拖拽中 ESC/Ctrl+Z 改为取消拖拽（不撤销 shape）
+    if (waveDragActive) { cancelWaveDrag(); e.preventDefault(); return }
+    if (e.key === 'Escape') {
+      if (waveP0.value) {
+        clearWave()                            // 有正在画的波浪：清当前预览
+      } else if (waveShapes.value.length > 0) {
+        undoLastWaveShape()                    // 无正在画的波浪：撤销最后一个已完成波浪
+      } else {
+        toggleWave()                           // 无任何波浪：退出波浪模式
+      }
+    } else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+      e.preventDefault()
+      undoLastWaveShape()                      // Ctrl+Z 撤销最后一个已完成波浪
+    }
+  }
+  window.addEventListener('keydown', waveKeydownHandler, true)
+}
+
+function detachWaveKeydown() {
+  if (waveKeydownHandler) {
+    window.removeEventListener('keydown', waveKeydownHandler, true)
+    waveKeydownHandler = null
+  }
+}
+
+// ===== 波浪点拖拽（复用 longDragWindowListeners 范式：pane pointerdown 命中 → window pointermove/up）=====
+
+/** 把拖拽中的端点/中间点变更同步到 waveShapes.value（数据源）+ wavePrimitive（镜像） */
+function updateWaveShapePoint(shapeIndex, pointIdx, pt) {
+  const shape = waveShapes.value[shapeIndex]
+  if (!shape) return
+  const mode = shape.mode || 'impulse5'
+  const anchorIdx = mode === 'predict3' ? 3 : 5
+  if (pointIdx === 0) {
+    shape.p0 = pt
+    shape.overrides = undefined            // 拖端点 → 清中间点覆盖，重算斐波那契
+  } else if (pointIdx === anchorIdx) {
+    shape.p5 = pt
+    shape.overrides = undefined            // predict3 拖 P3 同样清 overrides[4/5]
+  } else {
+    shape.overrides ||= {}
+    shape.overrides[pointIdx] = pt
+  }
+  if (wavePrimitive) wavePrimitive.updatePoint(shapeIndex, pointIdx, pt)
+}
+
+function onWavePanePointerDown(e) {
+  if (drawingActiveTool.value) return       // 绘图工具激活时禁用波浪拖拽
+  if (!showWave.value || !wavePrimitive) return
+  // 仅左键/触摸（参照 long 范式）
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  // 正在画新波浪的第二点时禁拖（waveP0 已设，避免与 handleWaveClick 冲突）
+  if (waveP0.value) return
+  // 优先用缓存的 crosshair 点（坐标系已对齐），无缓存则用 rect 计算本地坐标
+  let mx, my
+  if (lastCrosshairPoint) {
+    mx = lastCrosshairPoint.x
+    my = lastCrosshairPoint.y
+  } else {
+    const paneEl = getLongDragPaneElement()
+    if (!paneEl) return
+    const r = paneEl.getBoundingClientRect()
+    mx = e.clientX - r.left
+    my = e.clientY - r.top
+  }
+  const hit = wavePrimitive.hitTest(mx, my)
+  if (!hit) return
+  waveDragActive = true
+  waveDragTarget = hit
+  waveDragSuppressClick = true
+  attachWaveDragWindowListeners()
+  const paneEl = getLongDragPaneElement()
+  if (paneEl) paneEl.style.cursor = 'grabbing'
+  e.preventDefault()
+}
+
+function onWaveDragWindowMove(e) {
+  if (!waveDragActive || !waveDragTarget || !chart || !candleSeries) return
+  const paneEl = getLongDragPaneElement()
+  if (!paneEl) return
+  const r = paneEl.getBoundingClientRect()
+  const localX = e.clientX - r.left
+  // snap 到最近 K 线：coordinateToLogical 两根之间返回浮点（不返回 null），越界返回 null
+  // 不用 coordinateToTime+findRawRowByChartTime（两根之间返回 null + O(n) 扫描）
+  const logical = chart.timeScale().coordinateToLogical(localX)
+  if (logical == null) return
+  const idx = Math.max(0, Math.round(logical))
+  // 越界时 NearestLeft 兜底到最后一根；idx<0 已被 Math.max(0,...) 挡住
+  const bar = candleSeries.dataByIndex(idx, MismatchDirection.NearestLeft)
+  if (!bar) return
+  const price = Number(bar.close)
+  if (!Number.isFinite(price)) return
+  const pt = { time: bar.time, price }
+  updateWaveShapePoint(waveDragTarget.shapeIndex, waveDragTarget.pointIdx, pt)
+}
+
+function onWaveDragWindowUp() {
+  waveDragActive = false
+  waveDragTarget = null
+  detachWaveDragWindowListeners()
+  // pointerup → click → setTimeout(0) 顺序，抑制尾随 click（参照 long 范式）
+  setTimeout(() => { waveDragSuppressClick = false }, 0)
+  // 复位光标，让下一次 crosshairMove 重新决定
+  const paneEl = getLongDragPaneElement()
+  if (paneEl) paneEl.style.cursor = ''
+}
+
+function attachWaveDragWindowListeners() {
+  if (waveDragListenersOn) return
+  waveDragListenersOn = true
+  window.addEventListener('pointermove', onWaveDragWindowMove, true)
+  window.addEventListener('pointerup', onWaveDragWindowUp, true)
+  window.addEventListener('pointercancel', onWaveDragWindowUp, true)
+}
+
+function detachWaveDragWindowListeners() {
+  if (!waveDragListenersOn) return
+  waveDragListenersOn = false
+  window.removeEventListener('pointermove', onWaveDragWindowMove, true)
+  window.removeEventListener('pointerup', onWaveDragWindowUp, true)
+  window.removeEventListener('pointercancel', onWaveDragWindowUp, true)
+}
+
+/** 取消正在进行的拖拽（不回滚已改的 shape；ESC/切换股票/清理时调用） */
+function cancelWaveDrag() {
+  if (!waveDragActive) return
+  waveDragActive = false
+  waveDragTarget = null
+  detachWaveDragWindowListeners()
+  waveDragSuppressClick = false
+  const paneEl = getLongDragPaneElement()
+  if (paneEl) paneEl.style.cursor = ''
+}
+
+function attachWavePanePointerDown() {
+  const paneEl = getLongDragPaneElement()
+  if (!paneEl || wavePanePointerDownHandler) return
+  wavePanePointerDownHandler = onWavePanePointerDown
+  paneEl.addEventListener('pointerdown', wavePanePointerDownHandler)
+}
+
+function detachWavePanePointerDown() {
+  if (!wavePanePointerDownHandler) return
+  const paneEl = getLongDragPaneElement()
+  if (paneEl) paneEl.removeEventListener('pointerdown', wavePanePointerDownHandler)
+  wavePanePointerDownHandler = null
+}
+
+/** 波浪点 hover 光标反馈（crosshairMoveHandler 里 refreshLongPriceLineCursorFromCrosshair 之后调用） */
+function refreshWavePointCursor(param) {
+  if (waveDragActive) return              // 拖拽中光标由 onWavePanePointerDown/Up 管理
+  if (longPositionDragActive) return      // long 拖拽优先，让 long 处理
+  const paneEl = getLongDragPaneElement()
+  if (!paneEl) return
+  if (!showWave.value || !wavePrimitive || !param || param.point === undefined) return
+  if (param.paneIndex != null && param.paneIndex !== 0) return
+  const hit = wavePrimitive.hitTest(param.point.x, param.point.y)
+  if (hit) paneEl.style.cursor = 'grab'
 }
 
 function fillLongEntryFromLatestClose() {
@@ -2500,8 +4831,9 @@ function clearPoll() {
 
 function setupPoll() {
   clearPoll()
-  if (props.realtimeIntervalMs > 0 && props.code) {
-    pollTimer = setInterval(refreshLatestPoll, props.realtimeIntervalMs)
+  const ms = pollIntervalMs.value
+  if (ms > 0 && props.code) {
+    pollTimer = setInterval(refreshLatestPoll, ms)
   }
 }
 
@@ -2513,6 +4845,13 @@ function disposeChart() {
   }
   stopHistoryVisiblePoll()
   detachLongDragWindowListeners()
+  detachMeasureKeydown()
+  detachWaveKeydown()
+  detachWavePanePointerDown()
+  detachWaveDragWindowListeners()
+  waveDragActive = false
+  waveDragTarget = null
+  waveDragSuppressClick = false
   detachLongPriceLinePaneListener()
   cancelLongFocusBlurTimer()
   longFocusedPriceField.value = null
@@ -2545,12 +4884,55 @@ function disposeChart() {
       /* ignore */
     }
     clearLongPositionPriceLines()
+    if (measurePrimitive && candleSeries) {
+      try { candleSeries.detachPrimitive(measurePrimitive) } catch { /* ignore */ }
+    }
+    measurePrimitive = null
+    if (wavePrimitive && candleSeries) {
+      try { candleSeries.detachPrimitive(wavePrimitive) } catch { /* ignore */ }
+    }
+    wavePrimitive = null
+    if (volumeProfilePrimitive && candleSeries) {
+      try { candleSeries.detachPrimitive(volumeProfilePrimitive) } catch { /* ignore */ }
+    }
+    volumeProfilePrimitive = null
+    clearPocPriceLine()
+    if (tdSequentialPrimitive && candleSeries) {
+      try { candleSeries.detachPrimitive(tdSequentialPrimitive) } catch { /* ignore */ }
+    }
+    tdSequentialPrimitive = null
+    if (massZonePrimitive && candleSeries) {
+      try { candleSeries.detachPrimitive(massZonePrimitive) } catch { /* ignore */ }
+    }
+    massZonePrimitive = null
+    if (divergencePrimitive && candleSeries) {
+      try { candleSeries.detachPrimitive(divergencePrimitive) } catch { /* ignore */ }
+    }
+    divergencePrimitive = null
+    if (buySellPrimitive && candleSeries) {
+      try { candleSeries.detachPrimitive(buySellPrimitive) } catch { /* ignore */ }
+    }
+    buySellPrimitive = null
+    if (temaTurnPrimitive && candleSeries) {
+      try { candleSeries.detachPrimitive(temaTurnPrimitive) } catch { /* ignore */ }
+    }
+    temaTurnPrimitive = null
+    if (bbiSeries) {
+      try { chart.removeSeries(bbiSeries) } catch { /* ignore */ }
+    }
+    bbiSeries = null
+    if (limitPriceLineHandles.length > 0 && candleSeries) {
+      for (const pl of limitPriceLineHandles) {
+        try { candleSeries.removePriceLine(pl) } catch { /* ignore */ }
+      }
+    }
+    limitPriceLineHandles = []
     chart.remove()
     chart = null
     candleSeries = null
     volSeries = null
   }
-  ind.ma5 = ind.ma10 = ind.ma20 = ind.ma60 = null
+  ind.ma5 = ind.ma10 = ind.ma20 = ind.ma60 = ind.ma250 = null
   ind.bollU = ind.bollM = ind.bollL = null
   ind.obv = null
   ind.macdHist = ind.macdDif = ind.macdDea = null
@@ -2591,8 +4973,8 @@ function disposeChart() {
   ind.smcIntLow = null
   ind.smcBos = null
   ind.smcChoch = null
-  ind.smcSwingBos = null
-  ind.smcSwingChoch = null
+  ind.smcSwBos = null
+  ind.smcSwChoch = null
   ind.smcFvgTop = null
   ind.smcFvgBot = null
   ind.smcObTop = null
@@ -2607,16 +4989,29 @@ function scheduleLoadOlderDebounced() {
   }, 280)
 }
 
-/** 根据当前可见逻辑区间判断是否需要加载更早 K 线（与 subscribe 共用 + 轮询兜底） */
-function tryScheduleLoadOlderFromVisibleRange(range) {
+/** 左侧还差多少根才到数据起点。
+ *  barsInLogicalRange 在「可见区间完全不与数据相交」时返回 null（拖到最左且整屏都越过首根时就会这样），
+ *  此时用逻辑索引兜底：序列数据恒从逻辑索引 0 开始，range.from 即左侧缺失的柱数。 */
+function barsBeforeVisibleRange(lr) {
+  if (!candleSeries || !lr) return null
+  const info = candleSeries.barsInLogicalRange(lr)
+  if (info && typeof info.barsBefore === 'number') return info.barsBefore
+  return Math.floor(lr.from)
+}
+
+/** 根据当前可见逻辑区间判断是否需要加载更早 K 线（与 subscribe 共用 + 轮询兜底）。
+ *  immediate=true 时跳过防抖直接加载：轮询调用必须立即执行，
+ *  否则拖动惯性期间 subscribe 每帧回调会不断重置 280ms 防抖，导致加载永远不触发。 */
+function tryScheduleLoadOlderFromVisibleRange(range, immediate = false) {
   if (!chart || !candleSeries) return
   if (programmaticRangeDepth > 0 || loadingHistory.value || !hasMoreOlder.value) return
-  const lr = range ?? chart?.timeScale().getVisibleLogicalRange()
+  const lr = range ?? chart.timeScale().getVisibleLogicalRange()
   if (!lr) return
-  const info = candleSeries.barsInLogicalRange(lr)
-  if (!info || typeof info.barsBefore !== 'number') return
-  if (info.barsBefore < BARS_BEFORE_LOAD_MORE) {
-    scheduleLoadOlderDebounced()
+  const barsBefore = barsBeforeVisibleRange(lr)
+  if (!Number.isFinite(barsBefore)) return
+  if (barsBefore < BARS_BEFORE_LOAD_MORE) {
+    if (immediate) loadOlderHistory()
+    else scheduleLoadOlderDebounced()
   }
 }
 
@@ -2635,7 +5030,7 @@ function onVisibleTimeRangeChanged() {
 function startHistoryVisiblePoll() {
   stopHistoryVisiblePoll()
   historyVisiblePollTimer = setInterval(() => {
-    tryScheduleLoadOlderFromVisibleRange(null)
+    tryScheduleLoadOlderFromVisibleRange(null, true)
   }, 400)
 }
 
@@ -2659,6 +5054,7 @@ async function loadOlderHistory() {
   }
   const kltSnap = activeKlt.value
   const codeSnap = props.code
+  const adjustSnap = adjustFlagForRequest.value
   const oldest = mergedRawRows[0]
   const end = formatEastMoneyEndFromOldest(oldest.day, kltSnap)
   if (!end) {
@@ -2675,8 +5071,9 @@ async function loadOlderHistory() {
       kltSnap,
       HISTORY_PAGE_SIZE,
       end,
+      adjustSnap,
     )
-    if (kltSnap !== activeKlt.value || codeSnap !== props.code) return
+    if (kltSnap !== activeKlt.value || codeSnap !== props.code || adjustSnap !== adjustFlagForRequest.value) return
     const src = result?.source || ''
     if (src) activeDataSource.value = src
     const raw = result?.data
@@ -2698,6 +5095,7 @@ async function loadOlderHistory() {
     }
     lastOlderHistoryEndTried = ''
     mergedRawRows = merged
+    mergedRawRowsVersion.value++
     syncDefaultLatestPanelRow()
     withProgrammaticTimeRange(() => {
       applySeriesFromRaw()
@@ -2708,7 +5106,8 @@ async function loadOlderHistory() {
         })
       }
     })
-  } catch {
+  } catch (e) {
+    console.warn('[loadOlder] 请求异常', e, { code: codeSnap, klt: kltSnap, end })
     /* 网络/桥接异常：保留 hasMoreOlder，用户可继续拖动重试 */
   } finally {
     loadingHistory.value = false
@@ -2717,8 +5116,12 @@ async function loadOlderHistory() {
 
 async function refreshLatestPoll() {
   if (!props.code || !candleSeries) return
+  // 10 秒节奏下，MAC 单次请求最长等 5 秒并可能继续走降级链，需防止两次轮询叠加
+  if (pollInFlight) return
+  pollInFlight = true
   const kltSnap = activeKlt.value
   const codeSnap = props.code
+  const adjustSnap = adjustFlagForRequest.value
   try {
     const meta = INTERVALS.find((x) => x.klt === kltSnap) || INTERVALS[0]
     const result = await GetStockKLineWithFallback(
@@ -2726,18 +5129,22 @@ async function refreshLatestPoll() {
       props.stockName || '',
       meta.klt,
       meta.limit,
+      adjustSnap,
     )
-    if (codeSnap !== props.code || activeKlt.value !== kltSnap) return
+    if (codeSnap !== props.code || activeKlt.value !== kltSnap || adjustSnap !== adjustFlagForRequest.value) return
     const src = result?.source || ''
     if (src) activeDataSource.value = src
     const raw = result?.data
     const list = Array.isArray(raw) ? raw : []
     if (!list.length) return
     mergedRawRows = mergeRefreshWithLatest(mergedRawRows, list)
+    mergedRawRowsVersion.value++
     syncDefaultLatestPanelRow()
     withProgrammaticTimeRange(() => applySeriesFromRaw())
   } catch {
     /* 静默，避免打断看盘 */
+  } finally {
+    pollInFlight = false
   }
 }
 
@@ -2776,6 +5183,9 @@ function ensureChart() {
   chart.timeScale().subscribeVisibleTimeRangeChange(visibleTimeRangeHandler)
   startHistoryVisiblePoll()
   crosshairMoveHandler = (param) => {
+    lastCrosshairPoint = param && param.point != null ? param.point : null
+    updateMeasurePreview(param)
+    updateWavePreview(param)
     if (param.point === undefined) {
       hoverRawRow.value = null
       clearLongPriceLinePaneCursor()
@@ -2783,6 +5193,7 @@ function ensureChart() {
       return
     }
     refreshLongPriceLineCursorFromCrosshair(param)
+    refreshWavePointCursor(param)
     if (param.time === undefined) {
       hoverRawRow.value = null
       if (showChip.value) updateChipFromHover()
@@ -2799,6 +5210,18 @@ function ensureChart() {
   }
   chart.subscribeCrosshairMove(crosshairMoveHandler)
   chartClickHandler = (param) => {
+    if (waveDragSuppressClick) {
+      waveDragSuppressClick = false
+      return
+    }
+    if (showMeasure.value) {
+      handleMeasureClick(param)
+      return
+    }
+    if (showWave.value) {
+      handleWaveClick(param)
+      return
+    }
     if (longSuppressChartClick) return
     if (!candleSeries || !param.point) return
     if (param.paneIndex != null && param.paneIndex !== 0) return
@@ -2816,14 +5239,20 @@ function ensureChart() {
     applyLongClickPrice(price)
   }
   chart.subscribeClick(chartClickHandler)
+  if (showMeasure.value) ensureMeasurePrimitive()
+  if (showWave.value) ensureWavePrimitive()
   syncLongPositionPriceLines()
-  nextTick(() => attachLongPriceLineDragListeners())
+  nextTick(() => {
+    attachLongPriceLineDragListeners()
+    attachWavePanePointerDown()
+  })
 }
 
 async function loadData() {
   if (!props.code) {
     errorText.value = '未设置股票代码'
     mergedRawRows = []
+    mergedRawRowsVersion.value++
     syncDefaultLatestPanelRow()
     hasMoreOlder.value = true
     lastOlderHistoryEndTried = ''
@@ -2837,6 +5266,7 @@ async function loadData() {
   loading.value = true
   errorText.value = ''
   mergedRawRows = []
+  mergedRawRowsVersion.value++
   syncDefaultLatestPanelRow()
   hasMoreOlder.value = true
   lastOlderHistoryEndTried = ''
@@ -2847,6 +5277,7 @@ async function loadData() {
       props.stockName || '',
       meta.klt,
       meta.limit,
+      adjustFlagForRequest.value,
     )
     const src = result?.source || ''
     activeDataSource.value = src
@@ -2854,11 +5285,21 @@ async function loadData() {
     const list = Array.isArray(raw) ? raw : []
     ensureChart()
     mergedRawRows = mergeKlineRows([], list)
+    mergedRawRowsVersion.value++
     syncDefaultLatestPanelRow()
     const { candles } = toSeriesData(mergedRawRows)
     if (!candles.length) {
-      errorText.value =
-        '暂无 K 线数据（需东方财富或新浪支持的代码，如 600519.SH、000001.SZ）'
+      errorText.value = isBinanceCode.value
+        ? (src === 'binance-futures-invalid-symbol'
+            ? '币安合约代码无效（示例：bn:BTCUSDT）'
+            : '币安合约数据不可达：请在「设置 → 币安合约代理」中配置专用代理后重试')
+        : isBitgetCode.value
+          ? (src === 'bitget-futures-invalid-symbol'
+              ? '美股永续合约代码无效（示例：bt:AAPLUSDT）'
+              : '美股永续合约数据不可达：请在「设置 → Bitget合约代理」中配置专用代理后重试')
+          : isOKXCode.value
+            ? 'OKX 行情数据不可达：请在「设置 → 币安合约代理」中配置代理后重试（OKX 与币安共用该代理）'
+            : '暂无 K 线数据（如 600519.SH、000001.SZ、00700.HK、AAPL.US）'
       candleSeries?.setData([])
       volSeries?.setData([])
       syncIndicators()
@@ -2921,6 +5362,7 @@ const toggleAO = makeToggle(showAO, syncIndicators)
 const toggleHullMA = makeToggle(showHullMA, syncIndicators)
 const toggleAD = makeToggle(showAD, syncIndicators)
 const toggleTRIX = makeToggle(showTRIX, syncIndicators)
+const toggleTRIXSlope = makeToggle(showTRIXSlope, syncIndicators)
 const toggleROC = makeToggle(showROC, syncIndicators)
 const toggleFractal = makeToggle(showFractal, syncIndicators)
 const toggleCHOP = makeToggle(showCHOP, syncIndicators)
@@ -2931,8 +5373,56 @@ const toggleMassIndex = makeToggle(showMassIndex, syncIndicators)
 const toggleUlcerIndex = makeToggle(showUlcerIndex, syncIndicators)
 const toggleCoppock = makeToggle(showCoppock, syncIndicators)
 const toggleTEMA = makeToggle(showTEMA, syncIndicators)
+const toggleTEMASlope = makeToggle(showTEMASlope, syncIndicators)
 const toggleSMI = makeToggle(showSMI, syncIndicators)
+const toggleSignalRatio = makeToggle(showSignalRatio, syncIndicators)
 const toggleSMC = makeToggle(showSMC, syncIndicators)
+const toggleVolumeProfile = makeToggle(showVolumeProfile, syncVolumeProfilePrimitive)
+const toggleTDSequential = makeToggle(showTDSequential, syncTDSequentialPrimitive)
+const toggleBBI = makeToggle(showBBI, syncBBISeries)
+const toggleLimitLines = makeToggle(showLimitLines, syncLimitPriceLines)
+const toggleDivergence = makeToggle(showDivergence, syncDivergencePrimitive)
+const toggleBuySell = makeToggle(showBuySell, () => {
+  // 在点击手势内预热音频上下文，规避浏览器自动播放策略对后续轮询响铃的拦截
+  primeAlertAudio()
+  syncBuySellPrimitive()
+})
+/** 切换买卖点提示音；开启时试听一声以便确认音量/设备正常 */
+function toggleBuySellAlertSound() {
+  buySellAlertSound.value = !buySellAlertSound.value
+  if (buySellAlertSound.value) {
+    primeAlertAudio()
+    playBuySellAlertTone('buy')
+    warnIfAudioNotReady('买卖点提示音')
+  }
+}
+const toggleTemaTurn = makeToggle(showTemaTurn, () => {
+  // 同买卖点：在点击手势内预热音频上下文，保证后续轮询触发的响铃能出声
+  primeAlertAudio()
+  syncTemaTurnPrimitive()
+})
+/** 切换「T确」提示音；开启时试听一声以便确认音量/设备正常 */
+function toggleTemaTurnAlertSound() {
+  temaTurnAlertSound.value = !temaTurnAlertSound.value
+  if (temaTurnAlertSound.value) {
+    primeAlertAudio()
+    playTemaConfirmAlertTone('buy')
+    warnIfAudioNotReady('T确提示音')
+  }
+}
+/** 循环切换买卖点共振阈值：灵敏(2) → 标准(3) → 严格(4) */
+function cycleBuySellScore() {
+  const i = BUY_SELL_SCORE_OPTIONS.findIndex(o => o.value === buySellMinScore.value)
+  buySellMinScore.value = BUY_SELL_SCORE_OPTIONS[(i + 1) % BUY_SELL_SCORE_OPTIONS.length].value
+  syncBuySellPrimitive()
+}
+const toggleWeisWave = makeToggle(showWeisWave, syncIndicators)
+/** 切换背离指标源（RSI/MACD/KDJ），重新检测+重绘 */
+function setDivergenceSource(src) {
+  if (divergenceSource.value === src) return
+  divergenceSource.value = src
+  syncDivergencePrimitive()
+}
 let chipUpdateTimer = null
 
 function toggleChip() {
@@ -3069,19 +5559,23 @@ watch(longCostStr, (v) => {
 })
 
 onMounted(() => {
-  console.log('[DEBUG onMounted] starting')
+  try {
+    sidebarCollapsed.value = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'
+  } catch {}
+  // 任意交互即预热音频上下文（自动播放策略要求手势后才能出声），并持续在手势中恢复
+  window.addEventListener('pointerdown', primeAlertAudioOnGesture)
+  window.addEventListener('keydown', primeAlertAudioOnGesture)
   nextTick(() => {
-    console.log('[DEBUG onMounted] nextTick callback')
-    console.log('[DEBUG onMounted] current longEntryStr:', longEntryStr.value, 'showLongPosition:', showLongPosition.value)
     ensureChart()
-    console.log('[DEBUG onMounted] after ensureChart, candleSeries:', !!candleSeries)
     loadData()
-    console.log('[DEBUG onMounted] after loadData call')
     setupPoll()
+    refreshFollowStatus()
   })
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('pointerdown', primeAlertAudioOnGesture)
+  window.removeEventListener('keydown', primeAlertAudioOnGesture)
   disposeChart()
 })
 
@@ -3089,16 +5583,44 @@ watch(
   () => props.code,
   () => {
     hoverRawRow.value = null
+    clearAllMeasure()
+    clearAllWave()
     loadData()
     setupPoll()
+    refreshFollowStatus()
   },
 )
 
 watch(activeKlt, () => {
   hoverRawRow.value = null
+  clearAllMeasure()
+  clearAllWave()
+  clearDrawingTool()
+  clearAllDrawings()
   chart?.applyOptions(chartThemeOptions(props.darkTheme))
   loadData()
   setupPoll()
+})
+
+// 切换波浪绘制模式：清空已画波浪（不同模式 shape 语义不同，避免混用）+ 同步 primitive
+watch(waveMode, (v) => {
+  clearAllWave()
+  if (wavePrimitive) wavePrimitive.setMode(v)
+})
+
+// 切换复权类型时重新加载（仅日K类周期有效，分时周期 adjustFlag 为空串不影响数据）
+watch(activeAdjust, () => {
+  if (!DAILY_LIKE_KLT.has(activeKlt.value)) return
+  hoverRawRow.value = null
+  loadData()
+})
+
+// 代码切换时（调用方未用 :key 重建组件的防御性处理）按 ETF/港股/中证指数/海外指数/币安合约/美股永续/OKX 规则重置复权默认值
+watch(() => props.code, () => {
+  const next = (isEtfCode.value || isHkCode.value || isCsiIndexCode.value || isGlobalIndexCode.value || isBinanceCode.value || isBitgetCode.value || isOKXCode.value) ? 'none' : DEFAULT_ADJUST
+  if (activeAdjust.value !== next) {
+    activeAdjust.value = next
+  }
 })
 
 watch(
@@ -3122,6 +5644,9 @@ watch(
   () => setupPoll(),
 )
 
+// 数据源变化会改变实际轮询间隔（通达信MAC→10秒），需重建定时器
+watch(activeDataSource, () => setupPoll())
+
 watch(
   [showLongPosition, longEntryStr, longStopStr, longTakeProfitStr],
   () => {
@@ -3143,313 +5668,402 @@ watch(showLongPosition, (newVal) => {
 <template>
   <div class="lw-kline-root" :class="{ 'lw-kline--dark': darkTheme }">
     <div class="lw-kline-body">
-      <div class="lw-kline-sidebar">
-        <div class="lw-kline-sidebar__inner">
+      <div class="lw-kline-sidebar" :class="{ 'lw-kline-sidebar--collapsed': sidebarCollapsed }">
+        <div v-show="!sidebarCollapsed" class="lw-kline-sidebar__inner">
           <NFlex vertical :size="6">
             <div class="lw-kline-sidebar__section">
               <NText depth="3" style="font-size: 13px; font-weight: 700; display: block; margin-bottom: 4px; padding: 2px 6px; background: rgba(239,68,68,0.08); border-radius: 4px; border-left: 3px solid #ef4444; color: #ef4444">📈趋势</NText>
-              <NFlex :size="4" wrap style="row-gap: 4px">
+              <div class="lw-kline-sidebar__group">
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showMA ? 'primary' : 'default'" :secondary="!showMA" @click="toggleMA">MA</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.ma }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.ma }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showEMA ? 'primary' : 'default'" :secondary="!showEMA" @click="toggleEMA">EMA</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.ema }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.ema }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showBBI ? 'primary' : 'default'" :secondary="!showBBI" @click="toggleBBI">BBI</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.bbi }}</span>
+                </NTooltip>
+                <NTooltip v-if="!isBinanceCode && !isBitgetCode && !isOKXCode" :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showLimitLines ? 'primary' : 'default'" :secondary="!showLimitLines" @click="toggleLimitLines">涨跌停</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.limitLines }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showKAMA ? 'primary' : 'default'" :secondary="!showKAMA" @click="toggleKAMA">KAMA</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.kama }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.kama }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showSupertrend ? 'primary' : 'default'" :secondary="!showSupertrend" @click="toggleSupertrend">STrend</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.supertrend }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showSAR ? 'primary' : 'default'" :secondary="!showSAR" @click="toggleSAR">SAR</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.sar }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.supertrend }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showIchimoku ? 'primary' : 'default'" :secondary="!showIchimoku" @click="toggleIchimoku">Ichi</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.ichimoku }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.ichimoku }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showAroon ? 'primary' : 'default'" :secondary="!showAroon" @click="toggleAroon">Aroon</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.aroon }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.aroon }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showDEMA ? 'primary' : 'default'" :secondary="!showDEMA" @click="toggleDEMA">DEMA</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.dema }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.dema }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showSATS ? 'primary' : 'default'" :secondary="!showSATS" @click="toggleSATS">SATS</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.sats }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.sats }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showAlligator ? 'primary' : 'default'" :secondary="!showAlligator" @click="toggleAlligator">Gator</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.alligator }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.alligator }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showHullMA ? 'primary' : 'default'" :secondary="!showHullMA" @click="toggleHullMA">Hull</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.hullMA }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.hullMA }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showTEMA ? 'primary' : 'default'" :secondary="!showTEMA" @click="toggleTEMA">TEMA</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.tema }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.tema }}</span>
                 </NTooltip>
-              </NFlex>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showTEMASlope ? 'primary' : 'default'" :secondary="!showTEMASlope" @click="toggleTEMASlope">TEMA斜率</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.temaSlope }}</span>
+                </NTooltip>
+              </div>
             </div>
             <div class="lw-kline-sidebar__section">
               <NText depth="3" style="font-size: 13px; font-weight: 700; display: block; margin-bottom: 4px; padding: 2px 6px; background: rgba(245,158,11,0.08); border-radius: 4px; border-left: 3px solid #f59e0b; color: #d97706">🎢波动</NText>
-              <NFlex :size="4" wrap style="row-gap: 4px">
+              <div class="lw-kline-sidebar__group">
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showBOLL ? 'primary' : 'default'" :secondary="!showBOLL" @click="toggleBOLL">BOLL</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.boll }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.boll }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showKeltner ? 'primary' : 'default'" :secondary="!showKeltner" @click="toggleKeltner">Kelt</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.keltner }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.keltner }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showDonchian ? 'primary' : 'default'" :secondary="!showDonchian" @click="toggleDonchian">Donch</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.donchian }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.donchian }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showATR ? 'primary' : 'default'" :secondary="!showATR" @click="toggleATR">ATR</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.atr }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.atr }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showAvgAmp ? 'primary' : 'default'" :secondary="!showAvgAmp" @click="toggleAvgAmp">均幅</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.avgAmp }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.avgAmp }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showTTMSqueeze ? 'primary' : 'default'" :secondary="!showTTMSqueeze" @click="toggleTTMSqueeze">TTM</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.ttmSqueeze }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.ttmSqueeze }}</span>
+                </NTooltip>
+              </div>
+            </div>
+            <div class="lw-kline-sidebar__section">
+              <NText depth="3" style="font-size: 13px; font-weight: 700; display: block; margin-bottom: 4px; padding: 2px 6px; background: rgba(234,88,12,0.08); border-radius: 4px; border-left: 3px solid #ea580c; color: #c2410c">🔄反转</NText>
+              <div class="lw-kline-sidebar__group">
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showTDSequential ? 'primary' : 'default'" :secondary="!showTDSequential" @click="toggleTDSequential">九转</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.tdSequential }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
-                    <NButton size="tiny" :type="showZigZag ? 'primary' : 'default'" :secondary="!showZigZag" @click="toggleZigZag">ZigZag</NButton>
+                    <NFlex :size="2" :wrap="false">
+                      <NButton size="tiny" :type="showDivergence ? 'primary' : 'default'" :secondary="!showDivergence" @click="toggleDivergence">背离</NButton>
+                      <NButton v-if="showDivergence" size="tiny" quaternary style="padding: 0 4px; font-size: 11px" @click="setDivergenceSource(divergenceSource === 'rsi' ? 'macd' : divergenceSource === 'macd' ? 'kdj' : 'rsi')">
+                        {{ divergenceSource === 'rsi' ? 'RSI' : divergenceSource === 'macd' ? 'MACD' : 'KDJ' }}
+                      </NButton>
+                    </NFlex>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.zigzag }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showFractal ? 'primary' : 'default'" :secondary="!showFractal" @click="toggleFractal">Fractal</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.fractal }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.divergence }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showMassIndex ? 'primary' : 'default'" :secondary="!showMassIndex" @click="toggleMassIndex">Mass</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.massIndex }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showSMC ? 'primary' : 'default'" :secondary="!showSMC" @click="toggleSMC">SMC</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.smc }}</span>
-                </NTooltip>
-              </NFlex>
-            </div>
-            <div class="lw-kline-sidebar__section">
-              <NText depth="3" style="font-size: 13px; font-weight: 700; display: block; margin-bottom: 4px; padding: 2px 6px; background: rgba(59,130,246,0.08); border-radius: 4px; border-left: 3px solid #3b82f6; color: #2563eb">💫动量</NText>
-              <NFlex :size="4" wrap style="row-gap: 4px">
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showMACD ? 'primary' : 'default'" :secondary="!showMACD" @click="toggleMACD">MACD</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.macd }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showKDJ ? 'primary' : 'default'" :secondary="!showKDJ" @click="toggleKDJ">KDJ</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.kdj }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showRSI ? 'primary' : 'default'" :secondary="!showRSI" @click="toggleRSI">RSI</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.rsi }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showCCI ? 'primary' : 'default'" :secondary="!showCCI" @click="toggleCCI">CCI</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.cci }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showWilliamsR ? 'primary' : 'default'" :secondary="!showWilliamsR" @click="toggleWilliamsR">W%R</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.williamsR }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showStochRSI ? 'primary' : 'default'" :secondary="!showStochRSI" @click="toggleStochRSI">SRSI</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.stochRsi }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showCMO ? 'primary' : 'default'" :secondary="!showCMO" @click="toggleCMO">CMO</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.cmo }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showAO ? 'primary' : 'default'" :secondary="!showAO" @click="toggleAO">AO</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.ao }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showTRIX ? 'primary' : 'default'" :secondary="!showTRIX" @click="toggleTRIX">TRIX</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.trix }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showROC ? 'primary' : 'default'" :secondary="!showROC" @click="toggleROC">ROC</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.roc }}</span>
-                </NTooltip>
-                <NTooltip :delay="500" placement="right-start">
-                  <template #trigger>
-                    <NButton size="tiny" :type="showSMI ? 'primary' : 'default'" :secondary="!showSMI" @click="toggleSMI">SMI</NButton>
-                  </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.smi }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.massIndex }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showCoppock ? 'primary' : 'default'" :secondary="!showCoppock" @click="toggleCoppock">Coppck</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.coppock }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.coppock }}</span>
                 </NTooltip>
-              </NFlex>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NFlex :size="2" :wrap="false">
+                      <NButton size="tiny" :type="showTemaTurn ? 'primary' : 'default'" :secondary="!showTemaTurn" @click="toggleTemaTurn">TEMA转折</NButton>
+                      <NButton v-if="showTemaTurn" size="tiny" quaternary style="padding: 0 4px; font-size: 11px" @click="toggleTemaTurnAlertSound">
+                        {{ temaTurnAlertSound ? '音开' : '音关' }}
+                      </NButton>
+                    </NFlex>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.temaTurn }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showSMC ? 'primary' : 'default'" :secondary="!showSMC" @click="toggleSMC">SMC</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.smc }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showFractal ? 'primary' : 'default'" :secondary="!showFractal" @click="toggleFractal">Fractal</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.fractal }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showZigZag ? 'primary' : 'default'" :secondary="!showZigZag" @click="toggleZigZag">ZigZag</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.zigzag }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showSAR ? 'primary' : 'default'" :secondary="!showSAR" @click="toggleSAR">SAR</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.sar }}</span>
+                </NTooltip>
+              </div>
+            </div>
+            <div class="lw-kline-sidebar__section">
+              <NText depth="3" style="font-size: 13px; font-weight: 700; display: block; margin-bottom: 4px; padding: 2px 6px; background: rgba(59,130,246,0.08); border-radius: 4px; border-left: 3px solid #3b82f6; color: #2563eb">💫动量</NText>
+              <div class="lw-kline-sidebar__group">
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showMACD ? 'primary' : 'default'" :secondary="!showMACD" @click="toggleMACD">MACD</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.macd }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showKDJ ? 'primary' : 'default'" :secondary="!showKDJ" @click="toggleKDJ">KDJ</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.kdj }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showRSI ? 'primary' : 'default'" :secondary="!showRSI" @click="toggleRSI">RSI</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.rsi }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showCCI ? 'primary' : 'default'" :secondary="!showCCI" @click="toggleCCI">CCI</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.cci }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showWilliamsR ? 'primary' : 'default'" :secondary="!showWilliamsR" @click="toggleWilliamsR">W%R</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.williamsR }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showStochRSI ? 'primary' : 'default'" :secondary="!showStochRSI" @click="toggleStochRSI">SRSI</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.stochRsi }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showCMO ? 'primary' : 'default'" :secondary="!showCMO" @click="toggleCMO">CMO</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.cmo }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showAO ? 'primary' : 'default'" :secondary="!showAO" @click="toggleAO">AO</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.ao }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showTRIX ? 'primary' : 'default'" :secondary="!showTRIX" @click="toggleTRIX">TRIX</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.trix }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showTRIXSlope ? 'primary' : 'default'" :secondary="!showTRIXSlope" @click="toggleTRIXSlope">TRIX斜率</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.trixSlope }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showROC ? 'primary' : 'default'" :secondary="!showROC" @click="toggleROC">ROC</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.roc }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showSMI ? 'primary' : 'default'" :secondary="!showSMI" @click="toggleSMI">SMI</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.smi }}</span>
+                </NTooltip>
+              </div>
             </div>
             <div class="lw-kline-sidebar__section">
               <NText depth="3" style="font-size: 13px; font-weight: 700; display: block; margin-bottom: 4px; padding: 2px 6px; background: rgba(16,185,129,0.08); border-radius: 4px; border-left: 3px solid #10b981; color: #059669">📊量价</NText>
-              <NFlex :size="4" wrap style="row-gap: 4px">
+              <div class="lw-kline-sidebar__group">
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showOBV ? 'primary' : 'default'" :secondary="!showOBV" @click="toggleOBV">OBV</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.obv }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.obv }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showVWAP ? 'primary' : 'default'" :secondary="!showVWAP" @click="toggleVWAP">VWAP</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.vwap }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.vwap }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showMFI ? 'primary' : 'default'" :secondary="!showMFI" @click="toggleMFI">MFI</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.mfi }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.mfi }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showCMF ? 'primary' : 'default'" :secondary="!showCMF" @click="toggleCMF">CMF</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.cmf }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.cmf }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showForceIndex ? 'primary' : 'default'" :secondary="!showForceIndex" @click="toggleForceIndex">FI</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.forceIndex }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.forceIndex }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showAD ? 'primary' : 'default'" :secondary="!showAD" @click="toggleAD">A/D</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.ad }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.ad }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showChaikinOsc ? 'primary' : 'default'" :secondary="!showChaikinOsc" @click="toggleChaikinOsc">ChkOsc</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.chaikinOsc }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.chaikinOsc }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showVWAPBands ? 'primary' : 'default'" :secondary="!showVWAPBands" @click="toggleVWAPBands">VWBnd</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.vwapBands }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.vwapBands }}</span>
                 </NTooltip>
-              </NFlex>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showVolumeProfile ? 'primary' : 'default'" :secondary="!showVolumeProfile" @click="toggleVolumeProfile">VPVR</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.volumeProfile }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NFlex :size="2" :wrap="false">
+                      <NButton size="tiny" :type="showBuySell ? 'primary' : 'default'" :secondary="!showBuySell" @click="toggleBuySell">买卖点</NButton>
+                      <NButton v-if="showBuySell" size="tiny" quaternary style="padding: 0 4px; font-size: 11px" @click="cycleBuySellScore">
+                        {{ buySellScoreLabel }}
+                      </NButton>
+                      <NButton v-if="showBuySell" size="tiny" quaternary style="padding: 0 4px; font-size: 11px" @click="toggleBuySellAlertSound">
+                        {{ buySellAlertSound ? '音开' : '音关' }}
+                      </NButton>
+                    </NFlex>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.buySell }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showWeisWave ? 'primary' : 'default'" :secondary="!showWeisWave" @click="toggleWeisWave">WWave</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.weisWave }}</span>
+                </NTooltip>
+              </div>
             </div>
             <div class="lw-kline-sidebar__section">
               <NText depth="3" style="font-size: 13px; font-weight: 700; display: block; margin-bottom: 4px; padding: 2px 6px; background: rgba(139,92,246,0.08); border-radius: 4px; border-left: 3px solid #8b5cf6; color: #7c3aed">📏强度</NText>
-              <NFlex :size="4" wrap style="row-gap: 4px">
+              <div class="lw-kline-sidebar__group">
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showADX ? 'primary' : 'default'" :secondary="!showADX" @click="toggleADX">ADX</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.adx }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.adx }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showPivot ? 'primary' : 'default'" :secondary="!showPivot" @click="togglePivot">Pivot</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.pivot }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.pivot }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showCHOP ? 'primary' : 'default'" :secondary="!showCHOP" @click="toggleCHOP">CHOP</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.chop }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.chop }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showElderRay ? 'primary' : 'default'" :secondary="!showElderRay" @click="toggleElderRay">Elder</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.elderRay }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.elderRay }}</span>
                 </NTooltip>
                 <NTooltip :delay="500" placement="right-start">
                   <template #trigger>
                     <NButton size="tiny" :type="showUlcerIndex ? 'primary' : 'default'" :secondary="!showUlcerIndex" @click="toggleUlcerIndex">Ulcer</NButton>
                   </template>
-                  <span style="white-space: pre-line; text-align: left">{{ indicatorTips.ulcerIndex }}</span>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.ulcerIndex }}</span>
+                </NTooltip>
+                <NTooltip :delay="500" placement="right-start">
+                  <template #trigger>
+                    <NButton size="tiny" :type="showSignalRatio ? 'primary' : 'default'" :secondary="!showSignalRatio" @click="toggleSignalRatio">信号比</NButton>
+                  </template>
+                  <span style="display: block; white-space: pre-line; text-align: left">{{ indicatorTips.signalRatio }}</span>
                 </NTooltip>
                 <NButton
                   v-if="SHOW_CHIP_TOOLBAR_BUTTON"
@@ -3460,13 +6074,54 @@ watch(showLongPosition, (newVal) => {
                 >
                   筹码
                 </NButton>
-              </NFlex>
+              </div>
             </div>
           </NFlex>
         </div>
+        <button
+          type="button"
+          class="lw-kline-sidebar__toggle"
+          :title="sidebarCollapsed ? '展开指标栏' : '收起指标栏'"
+          @click="toggleSidebar"
+        >{{ sidebarCollapsed ? '›' : '‹' }}</button>
       </div>
       <div class="lw-kline-main">
         <NFlex :size="6" wrap style="row-gap: 4px; align-items: center">
+          <div v-if="code || stockName" class="lw-kline-title">
+            <span class="lw-kline-toolbar-name">{{ stockName || code }}</span>
+            <span v-if="stockName && code" class="lw-kline-toolbar-code">{{ code }}</span>
+          </div>
+          <template v-if="code">
+            <NDropdown
+              v-if="!isFollowed"
+              trigger="click"
+              :options="followGroupOptions"
+              :menu-props="() => ({ style: 'max-height:300px; overflow-y:auto;' })"
+              :disabled="followLoading"
+              @select="handleFollowSelect"
+              placement="bottom-start"
+            >
+              <NButton size="tiny" type="primary" :loading="followLoading" secondary>
+                + 关注
+              </NButton>
+            </NDropdown>
+            <NTooltip :delay="500">
+              <template #trigger>
+                <NButton
+                  v-if="isFollowed"
+                  size="tiny"
+                  type="success"
+                  :loading="followLoading"
+                  secondary
+                  @click="unfollowStock"
+                >
+                  ✓ 已关注
+                </NButton>
+              </template>
+              <span>点击取消关注</span>
+            </NTooltip>
+          </template>
+          <span style="width: 12px" />
           <NText depth="3" style="font-size: 12px; margin-right: 2px">周期</NText>
           <NButton
             v-for="it in INTERVALS"
@@ -3479,6 +6134,20 @@ watch(showLongPosition, (newVal) => {
             {{ it.label }}
           </NButton>
           <span style="width: 12px" />
+          <template v-if="DAILY_LIKE_KLT.has(activeKlt) && !isEtfCode.value && !isBinanceCode && !isBitgetCode && !isOKXCode">
+            <NText depth="3" style="font-size: 12px; margin-right: 2px">复权</NText>
+            <NButton
+              v-for="opt in ADJUST_OPTIONS"
+              :key="opt.value"
+              size="tiny"
+              :type="activeAdjust === opt.value ? 'primary' : 'default'"
+              :secondary="activeAdjust !== opt.value"
+              @click="activeAdjust = opt.value"
+            >
+              {{ opt.label }}
+            </NButton>
+            <span style="width: 12px" />
+          </template>
           <NText depth="3" style="font-size: 12px; margin-right: 2px">多单</NText>
           <NButton
             size="tiny"
@@ -3487,6 +6156,60 @@ watch(showLongPosition, (newVal) => {
             @click="toggleLongPosition"
           >
             价位线
+          </NButton>
+          <NButton
+            size="tiny"
+            :type="showMeasure ? 'primary' : 'default'"
+            :secondary="!showMeasure"
+            @click="toggleMeasure"
+            title="画框测量涨跌幅（ESC 清除）"
+          >
+            测量
+          </NButton>
+          <NButton
+            size="tiny"
+            :type="showWave ? 'primary' : 'default'"
+            :secondary="!showWave"
+            @click="toggleWave"
+            title="波浪理论绘图（5浪 / 3浪预测，ESC 清除，Ctrl+Z 撤销）"
+          >
+            波浪
+          </NButton>
+          <template v-if="showWave">
+            <NButton
+              v-for="opt in WAVE_MODE_OPTIONS"
+              :key="opt.value"
+              size="tiny"
+              :type="waveMode === opt.value ? 'primary' : 'default'"
+              :secondary="waveMode !== opt.value"
+              @click="waveMode = opt.value"
+            >
+              {{ opt.label }}
+            </NButton>
+          </template>
+          <NDropdown
+            trigger="click"
+            :options="drawingToolOptions"
+            placement="bottom-start"
+            @select="onDrawingToolSelect"
+          >
+            <NButton
+              size="tiny"
+              :type="drawingActiveTool ? 'primary' : 'default'"
+              :secondary="!drawingActiveTool"
+              title="绘图工具（趋势线/斐波那契/仓位预测，ESC 清除，Ctrl+Z 撤销）"
+            >
+              {{ drawingActiveToolLabel }} ▾
+            </NButton>
+          </NDropdown>
+          <NButton
+            v-if="drawingTotalCount > 0"
+            size="tiny"
+            secondary
+            @click="clearAllDrawings"
+            title="清空所有绘图"
+          >
+            清空({{ drawingTotalCount }})
           </NButton>
           <NInput
             v-model:value="longEntryStr"
@@ -3559,6 +6282,10 @@ watch(showLongPosition, (newVal) => {
           <template v-if="crosshairPanel">
             <div class="lw-kline-crosshair-strip__head">
               <span class="lw-kline-crosshair-strip__date">{{ crosshairPanel.title }}</span>
+              <template v-if="titleQuote">
+                <span class="lw-kline-crosshair-strip__quote" :style="{ color: titleQuote.color }">{{ titleQuote.price }}</span>
+                <span class="lw-kline-crosshair-strip__quote-pct" :style="{ color: titleQuote.color }">{{ titleQuote.pct }}</span>
+              </template>
             </div>
             <div class="lw-kline-crosshair-strip__grid">
               <span class="lw-kline-kv">
@@ -3639,24 +6366,72 @@ watch(showLongPosition, (newVal) => {
                   crosshairPanel.turnoverRate
                 }}</span>
               </span>
+              <span class="lw-kline-kv">
+                <span class="lw-kline-crosshair-strip__k">量比</span>
+                <span class="lw-kline-crosshair-strip__v" :style="{ color: crosshairPanel.cChg }">{{
+                  crosshairPanel.volumeRatio
+                }}</span>
+              </span>
             </div>
           </template>
           <NText v-else depth="3" style="font-size: 11px; line-height: 1.5">
             {{ loading ? '加载中…' : '暂无 K 线数据' }}
           </NText>
         </div>
+        <div
+          v-if="indicatorSignalSummary"
+          class="lw-kline-signal-summary"
+          :class="{ 'lw-kline-signal-summary--dark': darkTheme }"
+        >
+          <div class="lw-kline-signal-summary__head">
+            <span class="lw-kline-signal-summary__title">指标信号汇总</span>
+            <span class="lw-kline-signal-summary__total">共 {{ indicatorSignalSummary.total }} 项</span>
+          </div>
+          <div class="lw-kline-signal-summary__bar">
+            <div class="lw-kline-signal-summary__bar-seg lw-kline-signal-summary__bar-seg--bullish" :style="{ width: indicatorSignalSummary.bullishPct + '%' }"></div>
+            <div class="lw-kline-signal-summary__bar-seg lw-kline-signal-summary__bar-seg--bearish" :style="{ width: indicatorSignalSummary.bearishPct + '%' }"></div>
+            <div class="lw-kline-signal-summary__bar-seg lw-kline-signal-summary__bar-seg--oscillating" :style="{ width: indicatorSignalSummary.oscillatingPct + '%' }"></div>
+            <div class="lw-kline-signal-summary__bar-seg lw-kline-signal-summary__bar-seg--neutral" :style="{ width: indicatorSignalSummary.neutralPct + '%' }"></div>
+          </div>
+          <div class="lw-kline-signal-summary__legend">
+            <span class="lw-kline-signal-summary__legend-item">
+              <span class="lw-kline-signal-summary__dot lw-kline-signal-summary__dot--bullish"></span>
+              看多 {{ indicatorSignalSummary.bullish }} ({{ indicatorSignalSummary.bullishPct }}%)
+            </span>
+            <span class="lw-kline-signal-summary__legend-item">
+              <span class="lw-kline-signal-summary__dot lw-kline-signal-summary__dot--bearish"></span>
+              看空 {{ indicatorSignalSummary.bearish }} ({{ indicatorSignalSummary.bearishPct }}%)
+            </span>
+            <span class="lw-kline-signal-summary__legend-item">
+              <span class="lw-kline-signal-summary__dot lw-kline-signal-summary__dot--oscillating"></span>
+              震荡 {{ indicatorSignalSummary.oscillating }} ({{ indicatorSignalSummary.oscillatingPct }}%)
+            </span>
+            <span class="lw-kline-signal-summary__legend-item">
+              <span class="lw-kline-signal-summary__dot lw-kline-signal-summary__dot--neutral"></span>
+              中性 {{ indicatorSignalSummary.neutral }} ({{ indicatorSignalSummary.neutralPct }}%)
+            </span>
+          </div>
+          <div class="lw-kline-signal-summary__tags">
+            <span
+              v-for="s in indicatorSignalSummary.signals"
+              :key="s.name"
+              class="lw-kline-signal-summary__tag"
+              :class="'lw-kline-signal-summary__tag--' + s.signal"
+            >{{ s.name }}</span>
+          </div>
+        </div>
         <NText v-if="errorText" type="error" style="font-size: 12px">{{ errorText }}</NText>
         <div class="lw-kline-chart-wrap">
           <div
             ref="chartContainerRef"
             class="lw-kline-chart"
-            :style="{ height: chartHeight + 'px', minHeight: chartHeight + 'px' }"
+            :style="{ height: chartHeight-110 + 'px', minHeight: chartHeight-110 + 'px' }"
           />
           <div
             v-if="showChip"
             class="lw-chip"
             :class="{ 'lw-chip--dark': darkTheme }"
-            :style="{ height: chartHeight + 'px', minHeight: chartHeight + 'px' }"
+            :style="{ height: chartHeight-110 + 'px', minHeight: chartHeight-110 + 'px' }"
           >
             <div class="lw-chip__head">
               <span class="lw-chip__title">筹码分布</span>
@@ -3678,24 +6453,22 @@ watch(showLongPosition, (newVal) => {
             />
           </div>
         </div>
-        <NFlex align="center" :size="8" class="lw-kline-hint-row">
-          <NText depth="3" class="lw-kline-hint-text">
-            {{ stockName || code }} ·
-            {{ 
-              realtimeIntervalMs > 0
-                ? `每 ${Math.round(realtimeIntervalMs / 1000)} 秒刷新`
-                : '切换周期后加载'
-            }}
-            · 按住拖动查看左侧历史时会自动加载更早 K 线
-            <span v-if="activeDataSource" class="lw-kline-source-tag" :class="{ 'lw-kline-source-tag--fallback': activeDataSource !== 'eastmoney' }">
-              {{ activeDataSource === 'eastmoney' ? '东方财富' : activeDataSource === 'sina' ? '新浪财经' : activeDataSource === 'tencent' ? '腾讯财经' : activeDataSource === 'tdx' ? '通达信' : activeDataSource }}
-            </span>
-          </NText>
-          <NSpin v-if="loading || loadingHistory" size="small" />
-        </NFlex>
       </div>
     </div>
   </div>
+  <NModal v-model:show="addGroupShow" title="新建分组" style="width: 360px; text-align: left" preset="card">
+    <NInput
+      v-model:value="addGroupName"
+      placeholder="请输入分组名称"
+      @keyup.enter="saveAddGroup"
+    />
+    <template #footer>
+      <NFlex justify="end" :size="8">
+        <NButton size="small" type="primary" @click="saveAddGroup">保存</NButton>
+        <NButton size="small" @click="addGroupShow = false">取消</NButton>
+      </NFlex>
+    </template>
+  </NModal>
 </template>
 
 <style scoped>
@@ -3714,19 +6487,84 @@ watch(showLongPosition, (newVal) => {
 }
 .lw-kline-sidebar {
   flex: 0 0 auto;
-  width: 140px;
-  min-width: 120px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  /* 一行放 4 个指标按钮所需的宽度；窄屏时按视口收缩 */
+  width: clamp(260px, 20vw, 340px);
+  min-width: 240px;
+  /* 靠 .lw-kline-body 的 stretch 与右侧 K 线区等高铺满 */
+  overflow: hidden;
+  transition: width 0.15s ease;
+}
+/* 收起后只留一条窄边，宽度让给 K 线 */
+.lw-kline-sidebar--collapsed {
+  width: 18px;
+  min-width: 18px;
 }
 .lw-kline--dark .lw-kline-sidebar {
   border-color: #3f3f46;
 }
 .lw-kline-sidebar__inner {
   min-width: 0;
-  position: sticky;
-  top: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* 指标放不下时自身滚动，不撑高页面 */
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+/* 收起/展开按钮：钉在指标栏右上角，不随指标列表滚动 */
+.lw-kline-sidebar__toggle {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  z-index: 5;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  line-height: 1;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid #e2e8f0;
+  border-radius: 3px;
+  background: #ffffff;
+  color: #64748b;
+}
+.lw-kline-sidebar__toggle:hover {
+  color: #0ea5e9;
+  border-color: #0ea5e9;
+}
+.lw-kline--dark .lw-kline-sidebar__toggle {
+  background: #18181b;
+  border-color: #3f3f46;
+  color: #94a3b8;
+}
+.lw-kline--dark .lw-kline-sidebar__toggle:hover {
+  color: #38bdf8;
+  border-color: #38bdf8;
 }
 .lw-kline-sidebar__section {
   margin-bottom: 6px;
+}
+/* 指标按钮一行 4 个，行数减半便于整屏显示 */
+.lw-kline-sidebar .lw-kline-sidebar__group {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+}
+.lw-kline-sidebar .lw-kline-sidebar__group > .n-button {
+  width: 100%;
+  min-width: 0;
+}
+/* 带附加开关的复合项（背离/买卖点/TEMA转折）占两列，否则会挤出格子 */
+.lw-kline-sidebar .lw-kline-sidebar__group > .n-flex {
+  grid-column: span 2;
+}
+/* 过长的英文指标名省略显示，悬停有完整说明 */
+.lw-kline-sidebar .lw-kline-sidebar__group :deep(.n-button__content) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .lw-kline-main {
   flex: 1 1 0;
@@ -3735,16 +6573,25 @@ watch(showLongPosition, (newVal) => {
   flex-direction: column;
   gap: 6px;
 }
-.lw-kline-hint-row {
-  min-width: 0;
-  max-width: 100%;
+.lw-kline-toolbar-name {
+  font-size: 14px;
+  font-weight: 700;
+  white-space: nowrap;
 }
-.lw-kline-hint-text {
+.lw-kline-toolbar-code {
   font-size: 12px;
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  font-weight: 400;
+  color: #94a3b8;
+  margin-left: 2px;
+}
+.lw-kline--dark .lw-kline-toolbar-code {
+  color: #64748b;
+}
+.lw-kline-title {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-right: 4px;
 }
 .lw-kline-longpos-hint {
   font-size: 11px;
@@ -3792,7 +6639,21 @@ watch(showLongPosition, (newVal) => {
   background: #18181b;
 }
 .lw-kline-crosshair-strip__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 8px;
   margin-bottom: 4px;
+}
+.lw-kline-crosshair-strip__quote {
+  font-weight: 700;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.lw-kline-crosshair-strip__quote-pct {
+  font-weight: 600;
+  font-size: 12px;
+  white-space: nowrap;
 }
 .lw-kline-crosshair-strip__date {
   font-weight: 700;
@@ -3911,27 +6772,134 @@ watch(showLongPosition, (newVal) => {
   min-height: 0;
   display: block;
 }
-.lw-kline-source-tag {
+.lw-kline-signal-summary {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+}
+.lw-kline-signal-summary--dark {
+  border-color: #3f3f46;
+  background: #18181b;
+}
+.lw-kline-signal-summary__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.lw-kline-signal-summary__title {
+  font-weight: 700;
+  font-size: 12px;
+  color: #0f172a;
+  white-space: nowrap;
+}
+.lw-kline-signal-summary--dark .lw-kline-signal-summary__title {
+  color: #f1f5f9;
+}
+.lw-kline-signal-summary__total {
+  font-size: 11px;
+  color: #64748b;
+  white-space: nowrap;
+}
+.lw-kline-signal-summary--dark .lw-kline-signal-summary__total {
+  color: #94a3b8;
+}
+.lw-kline-signal-summary__bar {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #e2e8f0;
+  margin-bottom: 6px;
+}
+.lw-kline-signal-summary--dark .lw-kline-signal-summary__bar {
+  background: #3f3f46;
+}
+.lw-kline-signal-summary__bar-seg {
+  height: 100%;
+  min-width: 0;
+  transition: width 0.3s ease;
+}
+.lw-kline-signal-summary__bar-seg--bullish { background: #ef4444; }
+.lw-kline-signal-summary__bar-seg--bearish { background: #22c55e; }
+.lw-kline-signal-summary__bar-seg--oscillating { background: #f59e0b; }
+.lw-kline-signal-summary__bar-seg--neutral { background: #94a3b8; }
+.lw-kline-signal-summary__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: #334155;
+}
+.lw-kline-signal-summary--dark .lw-kline-signal-summary__legend {
+  color: #cbd5e1;
+}
+.lw-kline-signal-summary__legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.lw-kline-signal-summary__dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.lw-kline-signal-summary__dot--bullish { background: #ef4444; }
+.lw-kline-signal-summary__dot--bearish { background: #22c55e; }
+.lw-kline-signal-summary__dot--oscillating { background: #f59e0b; }
+.lw-kline-signal-summary__dot--neutral { background: #94a3b8; }
+.lw-kline-signal-summary__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.lw-kline-signal-summary__tag {
   display: inline-block;
   font-size: 10px;
   line-height: 1;
-  padding: 2px 5px;
+  padding: 3px 6px;
   border-radius: 3px;
-  background: #e0f2fe;
-  color: #0369a1;
-  vertical-align: middle;
-  margin-left: 4px;
+  white-space: nowrap;
 }
-.lw-kline--dark .lw-kline-source-tag {
-  background: #1e3a5f;
-  color: #7dd3fc;
+.lw-kline-signal-summary__tag--bullish {
+  background: #fef2f2;
+  color: #dc2626;
 }
-.lw-kline-source-tag--fallback {
-  background: #fef3c7;
-  color: #b45309;
+.lw-kline-signal-summary--dark .lw-kline-signal-summary__tag--bullish {
+  background: #450a0a;
+  color: #fca5a5;
 }
-.lw-kline--dark .lw-kline-source-tag--fallback {
-  background: #422006;
-  color: #fbbf24;
+.lw-kline-signal-summary__tag--bearish {
+  background: #f0fdf4;
+  color: #16a34a;
+}
+.lw-kline-signal-summary--dark .lw-kline-signal-summary__tag--bearish {
+  background: #052e16;
+  color: #86efac;
+}
+.lw-kline-signal-summary__tag--oscillating {
+  background: #fffbeb;
+  color: #d97706;
+}
+.lw-kline-signal-summary--dark .lw-kline-signal-summary__tag--oscillating {
+  background: #451a03;
+  color: #fcd34d;
+}
+.lw-kline-signal-summary__tag--neutral {
+  background: #f1f5f9;
+  color: #475569;
+}
+.lw-kline-signal-summary--dark .lw-kline-signal-summary__tag--neutral {
+  background: #1e293b;
+  color: #94a3b8;
 }
 </style>

@@ -1,6 +1,8 @@
 package data
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"go-stock/backend/db"
@@ -10,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -266,22 +269,77 @@ func (m MarketNewsApi) GetNewsList2(source string, limit int) *[]*models.Telegra
 func (m MarketNewsApi) GetTelegraphList(source string) *[]*models.Telegraph {
 	news := &[]*models.Telegraph{}
 	if source != "" {
-		db.Dao.Model(news).Preload("TelegraphTags").Where("source=?", source).Order("data_time desc,time desc").Limit(50).Find(news)
+		db.Dao.Model(news).Where("source=?", source).Order("data_time desc,time desc").Limit(50).Find(news)
 	} else {
-		db.Dao.Model(news).Preload("TelegraphTags").Order("data_time desc,time desc").Limit(50).Find(news)
+		db.Dao.Model(news).Order("data_time desc,time desc").Limit(50).Find(news)
 	}
-	for _, item := range *news {
-		tags := &[]models.Tags{}
-		db.Dao.Model(&models.Tags{}).Where("id in ?", lo.Map(item.TelegraphTags, func(item models.TelegraphTags, index int) uint {
-			return item.TagId
-		})).Find(&tags)
-		tagNames := lo.Map(*tags, func(item models.Tags, index int) string {
-			return item.Name
-		})
-		item.SubjectTags = tagNames
-		//logger.SugaredLogger.Infof("tagNames %v ，SubjectTags：%s", tagNames, item.SubjectTags)
-	}
+	fillTelegraphTags(*news)
 	return news
+}
+
+// fillTelegraphTags 批量补齐快讯的标签名。
+// 原实现逐条查询 Tags（50 条 = 50 次查询），这里改为两条批量查询：
+// 先取这些快讯的全部标签关联，再一次性取出标签名，避免 N+1。
+func fillTelegraphTags(news []*models.Telegraph) {
+	ids := make([]uint, 0, len(news))
+	for _, item := range news {
+		if item != nil {
+			ids = append(ids, item.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	var links []models.TelegraphTags
+	db.Dao.Model(&models.TelegraphTags{}).Where("telegraph_id in ?", ids).Find(&links)
+
+	tagIds := lo.Uniq(lo.Map(links, func(item models.TelegraphTags, _ int) uint {
+		return item.TagId
+	}))
+	tagNames := map[uint]string{}
+	if len(tagIds) > 0 {
+		var tags []models.Tags
+		db.Dao.Model(&models.Tags{}).Where("id in ?", tagIds).Find(&tags)
+		for _, tag := range tags {
+			tagNames[tag.ID] = tag.Name
+		}
+	}
+
+	byTelegraph := make(map[uint][]string, len(ids))
+	for _, link := range links {
+		if name, ok := tagNames[link.TagId]; ok {
+			byTelegraph[link.TelegraphId] = append(byTelegraph[link.TelegraphId], name)
+		}
+	}
+	for _, item := range news {
+		if item == nil {
+			continue
+		}
+		if names, ok := byTelegraph[item.ID]; ok {
+			item.SubjectTags = names
+		} else {
+			// 保持与逐条查询时一致的 JSON 形态（空数组而非 null）
+			item.SubjectTags = []string{}
+		}
+	}
+}
+
+// CleanOldTelegraph 清理指定天数之前的快讯及其标签关联，返回删除的快讯数与关联数。
+// 快讯表只增不减，而页面只展示每个源最新 50 条，历史数据会持续拖慢排序扫描并占用磁盘。
+// 使用 Unscoped 做物理删除，否则 GORM 只会写 deleted_at 标记，表仍然膨胀。
+func (m MarketNewsApi) CleanOldTelegraph(days int) (int64, int64) {
+	if days <= 0 {
+		return 0, 0
+	}
+	cutoff := time.Now().AddDate(0, 0, -days)
+	// 部分历史快讯（约 13 万行）data_time 为空，仅按 data_time 比较会永远漏掉它们，
+	// 这类记录用入库时间兜底判断。
+	cond := "(data_time IS NOT NULL AND data_time < ?) OR (data_time IS NULL AND created_at < ?)"
+	sub := db.Dao.Model(&models.Telegraph{}).Select("id").Where(cond, cutoff, cutoff)
+	linkRes := db.Dao.Unscoped().Where("telegraph_id in (?)", sub).Delete(&models.TelegraphTags{})
+	newsRes := db.Dao.Unscoped().Where(cond, cutoff, cutoff).Delete(&models.Telegraph{})
+	return newsRes.RowsAffected, linkRes.RowsAffected
 }
 func (m MarketNewsApi) GetTelegraphListWithPaging(source string, page, pageSize int) *[]*models.Telegraph {
 	// 计算偏移量
@@ -951,11 +1009,12 @@ func (m MarketNewsApi) EMDictCode(code string, cache *freecache.Cache) []any {
 }
 
 func (m MarketNewsApi) TradingViewNews() *[]models.Telegraph {
-	client := SharedHTTPClient
 	config := GetSettingConfig()
+	proxy := ""
 	if config.HttpProxyEnabled && config.HttpProxy != "" {
-		client.SetProxy(config.HttpProxy)
+		proxy = config.HttpProxy
 	}
+	client := CreateProxiedHTTPClient(15*time.Second, proxy)
 	TVNews := &[]models.TVNews{}
 	news := &[]models.Telegraph{}
 	//	url := "https://news-mediator.tradingview.com/news-flow/v2/news?filter=lang:zh-Hans&filter=area:WLD&client=screener&streaming=false"
@@ -1027,12 +1086,13 @@ func (m MarketNewsApi) TradingViewNewsDetail(id string) *models.TVNewsDetail {
 	newsDetail := &models.TVNewsDetail{}
 	newsUrl := fmt.Sprintf("https://news-headlines.tradingview.com/v3/story?id=%s&lang=zh-Hans", url.QueryEscape(id))
 
-	client := SharedHTTPClient
 	config := GetSettingConfig()
+	proxy := ""
 	if config.HttpProxyEnabled && config.HttpProxy != "" {
-		client.SetProxy(config.HttpProxy)
+		proxy = config.HttpProxy
 	}
-	request := client.SetTimeout(time.Duration(3) * time.Second).R()
+	client := CreateProxiedHTTPClient(3*time.Second, proxy)
+	request := client.R()
 	_, err := request.
 		SetHeader("Host", "news-headlines.tradingview.com").
 		SetHeader("Origin", "https://cn.tradingview.com").
@@ -1052,31 +1112,47 @@ func (m MarketNewsApi) TradingViewNewsDetail(id string) *models.TVNewsDetail {
 }
 
 func (m MarketNewsApi) XUEQIUHotStock(size int, marketType string) *[]models.HotItem {
-	cookieHeader, cookieErr := FetchXueqiuCookiesViaChromedp("", 30*time.Second, "https://xueqiu.com/hq#hot")
-	if cookieErr != nil {
-		logger.SugaredLogger.Warnf("雪球 chromedp 获取 cookie 失败: %v", cookieErr)
-	}
-
 	url := fmt.Sprintf("https://stock.xueqiu.com/v5/stock/hot_stock/list.json?page=1&size=%d&_type=%s&type=%s", size, marketType, marketType)
-	res := &models.XUEQIUHot{}
-	request := SharedHTTPClient.SetTimeout(time.Duration(30) * time.Second).R()
-	request.SetHeader("Host", "stock.xueqiu.com").
-		SetHeader("Origin", "https://xueqiu.com").
-		SetHeader("Referer", "https://xueqiu.com/").
-		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0")
-	if cookieErr == nil && cookieHeader != "" {
-		request.SetHeader("Cookie", cookieHeader)
+	empty := &[]models.HotItem{}
+
+	const maxRetries = 2
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		cookieHeader, cookieErr := FetchXueqiuCookiesViaChromedp("", 30*time.Second, "https://xueqiu.com/hq#hot")
+		if cookieErr != nil {
+			logger.SugaredLogger.Warnf("雪球 chromedp 获取 cookie 失败 (attempt %d): %v", attempt+1, cookieErr)
+		}
+
+		res := &models.XUEQIUHot{}
+		request := SharedHTTPClient.SetTimeout(time.Duration(30) * time.Second).R()
+		request.SetHeader("Host", "stock.xueqiu.com").
+			SetHeader("Origin", "https://xueqiu.com").
+			SetHeader("Referer", "https://xueqiu.com/").
+			SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0")
+		if cookieErr == nil && cookieHeader != "" {
+			request.SetHeader("Cookie", cookieHeader)
+		}
+		_, err := request.SetResult(res).Get(url)
+		if err != nil {
+			logger.SugaredLogger.Errorf("XUEQIUHotStock err (attempt %d):%s", attempt+1, err.Error())
+			if attempt < maxRetries-1 {
+				InvalidateXueqiuCookieCache()
+				time.Sleep(time.Second)
+				continue
+			}
+			return empty
+		}
+		if res.ErrorCode != 0 {
+			logger.SugaredLogger.Errorf("XUEQIUHotStock API error (attempt %d): code=%d, desc=%s", attempt+1, res.ErrorCode, res.ErrorDescription)
+			if attempt < maxRetries-1 {
+				InvalidateXueqiuCookieCache()
+				time.Sleep(time.Second)
+				continue
+			}
+			return empty
+		}
+		return &res.Data.Items
 	}
-	_, err := request.SetResult(res).Get(url)
-	if err != nil {
-		logger.SugaredLogger.Errorf("XUEQIUHotStock err:%s", err.Error())
-		return &[]models.HotItem{}
-	}
-	if res.ErrorCode != 0 {
-		logger.SugaredLogger.Errorf("XUEQIUHotStock API error: code=%d, desc=%s", res.ErrorCode, res.ErrorDescription)
-		return &[]models.HotItem{}
-	}
-	return &res.Data.Items
+	return empty
 }
 
 func (m MarketNewsApi) HotEvent(size int) *[]models.HotEvent {
@@ -1142,17 +1218,25 @@ func (m MarketNewsApi) InvestCalendar(yearMonth string) []any {
 		yearMonth = time.Now().Format("2006-01")
 	}
 
+	// 韭研公社网站 JS 逆向：token = md5("Uu0KfOB8iUP69d3c:" + timestamp)
+	// 无需 SESSION cookie，匿名访问即可
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	signSrc := "Uu0KfOB8iUP69d3c:" + timestamp
+	md5Sum := md5.Sum([]byte(signSrc))
+	token := hex.EncodeToString(md5Sum[:])
+
 	url := "https://app.jiuyangongshe.com/jystock-app/api/v1/timeline/list"
 	resp, err := SharedHTTPClient.SetTimeout(time.Duration(30)*time.Second).R().
 		SetHeader("Host", "app.jiuyangongshe.com").
 		SetHeader("Origin", "https://www.jiuyangongshe.com").
-		SetHeader("Referer", "https://www.jiuyangongshe.com/").
+		SetHeader("Referer", "https://www.jiuyangongshe.com/timeline").
 		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0").
 		SetHeader("Content-Type", "application/json").
-		SetHeader("token", "1cc6380a05c652b922b3d85124c85473").
 		SetHeader("platform", "3").
-		SetHeader("Cookie", "SESSION=NDZkNDU2ODYtODEwYi00ZGZkLWEyY2ItNjgxYzY4ZWMzZDEy").
-		SetHeader("timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10)).
+		SetHeader("Accept-Language", "en-US, zh; q=0.9, en; q=0.8").
+		SetHeader("X-Requested-With", "XMLHttpRequest").
+		SetHeader("timestamp", timestamp).
+		SetHeader("token", token).
 		SetBody(map[string]string{
 			"date":  yearMonth,
 			"grade": "0",
@@ -1162,10 +1246,18 @@ func (m MarketNewsApi) InvestCalendar(yearMonth string) []any {
 		logger.SugaredLogger.Errorf("InvestCalendar err:%s", err.Error())
 		return []any{}
 	}
-	//logger.SugaredLogger.Infof("InvestCalendar:%s", resp.Body())
 	respMap := map[string]any{}
 	err = json.Unmarshal(resp.Body(), &respMap)
-	return respMap["data"].([]any)
+	if err != nil {
+		logger.SugaredLogger.Errorf("InvestCalendar unmarshal err:%s,body:%s", err.Error(), resp.Body())
+		return []any{}
+	}
+	// errCode != 0 时 data 为空对象 {}，需类型断言保护避免 panic
+	if data, ok := respMap["data"].([]any); ok {
+		return data
+	}
+	logger.SugaredLogger.Errorf("InvestCalendar unexpected response:%s", resp.Body())
+	return []any{}
 
 }
 
@@ -1184,6 +1276,35 @@ func (m MarketNewsApi) ClsCalendar() []any {
 	respMap := map[string]any{}
 	err = json.Unmarshal(resp.Body(), &respMap)
 	return respMap["data"].([]any)
+}
+
+// ConceptEventList 获取同花顺每日炒作题材事件列表
+// date 格式: 2006-01-02，为空时默认当天，接口会返回该日及之前若干天的数据
+func (m MarketNewsApi) ConceptEventList(date string) *[]models.ConceptEventDay {
+	url := "https://news.10jqka.com.cn/app/concept_v2_api/open/api/concept/event/jtcsm/v1/event/list"
+	if date != "" {
+		url += "?date=" + date
+	}
+	resp, err := SharedHTTPClient.SetTimeout(time.Duration(30)*time.Second).R().
+		SetHeader("Host", "news.10jqka.com.cn").
+		SetHeader("Origin", "https://news.10jqka.com.cn").
+		SetHeader("Referer", "https://news.10jqka.com.cn/").
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0").
+		Get(url)
+	if err != nil {
+		logger.SugaredLogger.Errorf("ConceptEventList err:%s", err.Error())
+		return &[]models.ConceptEventDay{}
+	}
+	respMap := struct {
+		StatusCode int    `json:"status_code"`
+		StatusMsg  string `json:"status_msg"`
+		Data       []models.ConceptEventDay
+	}{}
+	if err := json.Unmarshal(resp.Body(), &respMap); err != nil {
+		logger.SugaredLogger.Errorf("ConceptEventList unmarshal err:%s,body:%s", err.Error(), resp.Body())
+		return &[]models.ConceptEventDay{}
+	}
+	return &respMap.Data
 }
 
 func (m MarketNewsApi) GetGDP() *models.GDPResp {
@@ -1390,11 +1511,12 @@ func (m MarketNewsApi) GetSecuritiesCompanyOpinionContent(OrgSName, encodeUrl st
 }
 
 func (m MarketNewsApi) ReutersNew() *models.ReutersNews {
-	client := SharedHTTPClient
 	config := GetSettingConfig()
+	proxy := ""
 	if config.HttpProxyEnabled && config.HttpProxy != "" {
-		client.SetProxy(config.HttpProxy)
+		proxy = config.HttpProxy
 	}
+	client := CreateProxiedHTTPClient(5*time.Second, proxy)
 	news := &models.ReutersNews{}
 	//url := "https://www.reuters.com/pf/api/v3/content/fetch/articles-by-section-alias-or-id-v1?query={\"arc-site\":\"reuters\",\"fetch_type\":\"collection\",\"offset\":0,\"section_id\":\"/world/\",\"size\":9,\"uri\":\"/world/\",\"website\":\"reuters\"}&d=300&mxId=00000000&_website=reuters"
 	url := "https://www.reuters.com/pf/api/v3/content/fetch/recent-stories-by-sections-v1?query=%7B%22section_ids%22%3A%22%2Fworld%2F%22%2C%22size%22%3A4%2C%22website%22%3A%22reuters%22%7D&d=334&mxId=00000000&_website=reuters"
@@ -1414,11 +1536,12 @@ func (m MarketNewsApi) ReutersNew() *models.ReutersNews {
 }
 
 func (m MarketNewsApi) InteractiveAnswer(page int, pageSize int, keyWord string) *models.InteractiveAnswer {
-	client := SharedHTTPClient
 	config := GetSettingConfig()
+	proxy := ""
 	if config.HttpProxyEnabled && config.HttpProxy != "" {
-		client.SetProxy(config.HttpProxy)
+		proxy = config.HttpProxy
 	}
+	client := CreateProxiedHTTPClient(5*time.Second, proxy)
 	url := fmt.Sprintf("https://irm.cninfo.com.cn/newircs/index/search?_t=%d", time.Now().Unix())
 	answers := &models.InteractiveAnswer{}
 	//logger.SugaredLogger.Infof("请求url:%s", url)
@@ -1525,6 +1648,20 @@ func (m MarketNewsApi) GetNewsListData(keyWord string, startTime time.Time, page
 	return &uniqueNews, total
 }
 
+// 涨停梯队查询短缓存：AI 会话中多个涨停工具（板块/个股/炸板）与回退循环会重复请求同一外部 API，
+// 用 60s TTL 缓存原始响应，避免重复的慢请求。
+var (
+	uplimitHotCacheMu sync.Mutex
+	uplimitHotCache   = map[string]uplimitHotCacheEntry{}
+)
+
+type uplimitHotCacheEntry struct {
+	body     []byte
+	expireAt time.Time
+}
+
+const uplimitHotCacheTTL = 60 * time.Second
+
 func (m MarketNewsApi) GetUplimitHot(date string, limit int) map[string]any {
 	if limit <= 0 {
 		limit = 20
@@ -1532,6 +1669,17 @@ func (m MarketNewsApi) GetUplimitHot(date string, limit int) map[string]any {
 	if date == "" {
 		loc, _ := time.LoadLocation("Asia/Shanghai")
 		date = time.Now().In(loc).Format("2006-01-02")
+	}
+	cacheKey := fmt.Sprintf("%s:%d", date, limit)
+	uplimitHotCacheMu.Lock()
+	if entry, ok := uplimitHotCache[cacheKey]; ok && time.Now().Before(entry.expireAt) {
+		uplimitHotCacheMu.Unlock()
+		var cached map[string]any
+		if err := json.Unmarshal(entry.body, &cached); err == nil {
+			return cached
+		}
+	} else {
+		uplimitHotCacheMu.Unlock()
 	}
 	apiUrl := fmt.Sprintf("https://api.zizizaizai.com/v3/open/review/uplimit/hot?date1=%s&limit=%d", date, limit)
 	resp, err := SharedHTTPClient.SetTimeout(15*time.Second).R().
@@ -1547,5 +1695,151 @@ func (m MarketNewsApi) GetUplimitHot(date string, limit int) map[string]any {
 		logger.SugaredLogger.Errorf("GetUplimitHot unmarshal error: %v", err)
 		return map[string]any{"code": 50000, "message": "数据解析失败"}
 	}
+	uplimitHotCacheMu.Lock()
+	uplimitHotCache[cacheKey] = uplimitHotCacheEntry{body: resp.Body(), expireAt: time.Now().Add(uplimitHotCacheTTL)}
+	uplimitHotCacheMu.Unlock()
 	return result
+}
+
+// GetUplimitHotSmart 带回退的涨停梯队查询（AI 工具用）：
+// date 为空时从今天起逐日向前回退（最多 6 天），返回最近一个有数据的交易日结果，
+// 避免周末/节假日查询当天拿到空数据；返回值二参为实际数据日期，供 AI 工具标注。
+func (m MarketNewsApi) GetUplimitHotSmart(date string, limit int) (map[string]any, string) {
+	if date == "" {
+		loc, _ := time.LoadLocation("Asia/Shanghai")
+		now := time.Now().In(loc)
+		var last map[string]any
+		for i := 0; i <= 6; i++ {
+			t := now.AddDate(0, 0, -i)
+			// 周末无涨停数据，直接跳过，减少无效的慢请求
+			if t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
+				continue
+			}
+			try := t.Format("2006-01-02")
+			res := m.GetUplimitHot(try, limit)
+			if code, _ := res["code"].(float64); int(code) != 20000 {
+				last = res
+				continue
+			}
+			dataMap, _ := res["data"].(map[string]any)
+			stocks, _ := dataMap["stocks"].(string)
+			if strings.TrimSpace(stocks) != "" {
+				return res, try
+			}
+			last = res
+		}
+		return last, now.Format("2006-01-02")
+	}
+	return m.GetUplimitHot(date, limit), date
+}
+
+// RzrqRank 获取同花顺融资融券排名数据
+// rzrqType: hyList(行业) / gnList(概念) / ggList(个股)
+// sortKey: jmr(净买入额) 等
+// sortType: desc/asc
+// length: 返回条数
+func (m MarketNewsApi) RzrqRank(rzrqType, sortKey, sortType, date string, length, offset int) *models.RzrqRankData {
+	res := &models.RzrqRankData{Type: rzrqType}
+	if rzrqType == "" {
+		return res
+	}
+	if sortKey == "" {
+		sortKey = "jmr"
+	}
+	if sortType == "" {
+		sortType = "desc"
+	}
+	if length <= 0 {
+		length = 5
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	apiUrl := fmt.Sprintf("https://eq.10jqka.com.cn/rzrqEnhance/index.php?op=getRankData&type=%s&sortKey=%s&sortType=%s&length=%d&offset=%d", rzrqType, sortKey, sortType, length, offset)
+	if date != "" {
+		apiUrl += "&date=" + date
+	}
+	resp, err := SharedHTTPClient.SetTimeout(15*time.Second).R().
+		SetHeader("Host", "eq.10jqka.com.cn").
+		SetHeader("Referer", "https://eq.10jqka.com.cn/").
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0").
+		Get(apiUrl)
+	if err != nil {
+		logger.SugaredLogger.Errorf("RzrqRank err:%s", err.Error())
+		return res
+	}
+	respMap := struct {
+		ErrorCode int                   `json:"errorCode"`
+		Data      []models.RzrqRankItem `json:"data"`
+		ErrorMsg  string                `json:"errorMsg"`
+	}{}
+	if err := json.Unmarshal(resp.Body(), &respMap); err != nil {
+		logger.SugaredLogger.Errorf("RzrqRank unmarshal err:%s,body:%s", err.Error(), resp.Body())
+		return res
+	}
+	res.List = respMap.Data
+	return res
+}
+
+// RzrqTrend 获取融资融券走势数据
+// rzrqType: hyList(行业) / gnList(概念) / ggList(个股)
+// code: 板块代码或股票代码，空字符串表示全市场汇总
+func (m MarketNewsApi) RzrqTrend(rzrqType, code string) *models.RzrqTrendData {
+	res := &models.RzrqTrendData{Type: rzrqType, Code: code}
+	apiUrl := "https://eq.10jqka.com.cn/rzrqEnhance/index.php?op=newIndexData"
+	resp, err := SharedHTTPClient.SetTimeout(15*time.Second).R().
+		SetHeader("Host", "eq.10jqka.com.cn").
+		SetHeader("Referer", "https://eq.10jqka.com.cn/").
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0").
+		Get(apiUrl)
+	if err != nil {
+		logger.SugaredLogger.Errorf("RzrqTrend err:%s", err.Error())
+		return res
+	}
+	respMap := struct {
+		ErrorCode int    `json:"errorCode"`
+		ErrorMsg  string `json:"errorMsg"`
+		Data      struct {
+			Chart struct {
+				RzyeUnit  string   `json:"rzyeUnit"`
+				SpjUnit   string   `json:"spjUnit"`
+				RzjlrUnit string   `json:"rzjlrUnit"`
+				SpzfUnit  string   `json:"spzfUnit"`
+				Date      []string `json:"date"`
+				Rzye      []string `json:"rzye"`
+				Rzjlr     []string `json:"rzjlr"`
+				Spj       []string `json:"spj"`
+				Spzf      []string `json:"spzf"`
+			} `json:"chart"`
+			UpdateTime string `json:"updateTime"`
+		} `json:"data"`
+	}{}
+	if err := json.Unmarshal(resp.Body(), &respMap); err != nil {
+		logger.SugaredLogger.Errorf("RzrqTrend unmarshal err:%s,body:%s", err.Error(), resp.Body())
+		return res
+	}
+	c := respMap.Data.Chart
+	res.RzyeUnit = c.RzyeUnit
+	res.RzjlrUnit = c.RzjlrUnit
+	res.SpjUnit = c.SpjUnit
+	res.SpzfUnit = c.SpzfUnit
+	res.UpdateTime = respMap.Data.UpdateTime
+	n := len(c.Date)
+	for i := 0; i < n; i++ {
+		item := models.RzrqTrendItem{Date: c.Date[i]}
+		if i < len(c.Rzye) {
+			item.Rzye = c.Rzye[i]
+		}
+		if i < len(c.Rzjlr) {
+			item.Rzjlr = c.Rzjlr[i]
+		}
+		if i < len(c.Spj) {
+			item.Spj = c.Spj[i]
+		}
+		if i < len(c.Spzf) {
+			item.Spzf = c.Spzf[i]
+		}
+		res.Items = append(res.Items, item)
+	}
+	return res
 }

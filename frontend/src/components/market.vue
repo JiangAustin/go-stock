@@ -11,15 +11,19 @@ import {
   IsTradingTime,
   IsHKTradingTime,
   IsUSTradingTime,
+  OpenURL,
   ReFleshTelegraphList,
   SaveAIResponseResult,
   SaveAsMarkdown,
   ShareAnalysis,
   SummaryStockNews,
+  AbortSummaryStockNewsByEvent,
+  GetVersionInfo,
   GetAiConfigs,
 } from "../../wailsjs/go/main/App";
 import {EventsOff, EventsOn} from "../../wailsjs/runtime";
 import NewsList from "./newsList.vue";
+import PolicyNewsList from "./PolicyNewsList.vue";
 import KLineChart from "./KLineChart.vue";
 import StockLightweightKlineChart from "./StockLightweightKlineChart.vue";
 import { CaretDown, CaretUp, PulseOutline,} from "@vicons/ionicons5";
@@ -31,13 +35,21 @@ import IndustryMoneyRank from "./industryMoneyRank.vue";
 import StockResearchReportList from "./StockResearchReportList.vue";
 import StockNoticeList from "./StockNoticeList.vue";
 import LongTigerRankList from "./LongTigerRankList.vue";
+import LhbHotMoneyDaily from "./LhbHotMoneyDaily.vue";
 import IndustryResearchReportList from "./IndustryResearchReportList.vue";
 import HotStockList from "./HotStockList.vue";
+import BinanceFuturesList from "./BinanceFuturesList.vue";
+import BitgetFuturesList from "./BitgetFuturesList.vue";
 import HotEvents from "./HotEvents.vue";
 import HotTopics from "./HotTopics.vue";
+import ConceptEventList from "./ConceptEventList.vue";
 import InvestCalendarTimeLine from "./InvestCalendarTimeLine.vue";
 import ClsCalendarTimeLine from "./ClsCalendarTimeLine.vue";
 import Stockhotmap from "./stockhotmap.vue";
+import BKFundFlowChart from "./bkFundFlowChart.vue";
+import ConceptFundFlowChart from "./conceptFundFlowChart.vue";
+import RzrqRank from "./RzrqRank.vue";
+import FuturesPositionChart from "./FuturesPositionChart.vue";
 
 const route = useRoute()
 const icon = ref('https://raw.githubusercontent.com/ArvinLovegood/go-stock/master/build/appicon.png');
@@ -62,6 +74,68 @@ const httpProxyEnabled = ref(false)
 const theme = computed(() => {
   return darkTheme ? 'dark' : 'light'
 })
+// Polymarket 预测市场列表
+const polymarketMarkets = ref([
+  {
+    marketSlug: 'will-the-fed-decrease-interest-rates-by-50-bps-after-the-october-2026-meeting-20260617190324029',
+    eventUrl: 'https://polymarket.com/event/fed-decision-in-october-20260617190323537#6qFvCxvE',
+    title: '美联储10月会议后：降息50+个基点',
+    yesPct: '0.15%',
+    noPct: '99.85%'
+  },
+  {
+    marketSlug: 'will-the-fed-decrease-interest-rates-by-25-bps-after-the-october-2026-meeting-20260617190324030',
+    eventUrl: 'https://polymarket.com/event/fed-decision-in-october-20260617190323537#6qFvCxvE',
+    title: '美联储10月会议后：降息25个基点',
+    yesPct: '0.45%',
+    noPct: '99.55%'
+  },
+  {
+    marketSlug: 'will-there-be-no-change-in-fed-interest-rates-after-the-october-2026-meeting-20260617190324031',
+    eventUrl: 'https://polymarket.com/event/fed-decision-in-october-20260617190323537#6qFvCxvE',
+    title: '美联储10月会议后：维持利率不变',
+    yesPct: '83.5%',
+    noPct: '16.5%'
+  },
+  {
+    marketSlug: 'will-the-fed-increase-interest-rates-by-25-bps-after-the-october-2026-meeting-20260617190324032',
+    eventUrl: 'https://polymarket.com/event/fed-decision-in-october-20260617190323537#6qFvCxvE',
+    title: '美联储10月会议后：加息25个基点',
+    yesPct: '15.5%',
+    noPct: '84.5%'
+  },
+  {
+    marketSlug: 'will-the-fed-increase-interest-rates-by-50-bps-after-the-october-2026-meeting-20260617190324033',
+    eventUrl: 'https://polymarket.com/event/fed-decision-in-october-20260617190323537#6qFvCxvE',
+    title: '美联储10月会议后：加息50+个基点',
+    yesPct: '0.35%',
+    noPct: '99.65%'
+  },
+  {
+    marketSlug: 'will-nvidia-be-the-largest-company-in-the-world-by-market-cap-on-december-31-244',
+    eventUrl: 'https://polymarket.com/event/largest-company-end-of-december-2026',
+    title: '问题：截至12月31日，NVIDIA 是否会成为全球市值最大的公司？',
+    yesPct: '56%',
+    noPct: '45%'
+  }
+])
+function polymarketSrc(m) {
+  return `https://embed.polymarket.com/market?market=${m.marketSlug}&theme=${darkTheme.value ? 'dark' : 'light'}&liveactivity=true&height=300`
+}
+function polymarketLdJson(m) {
+  return JSON.stringify({
+    '@context': 'https://schema.org',
+    '@type': 'WebPage',
+    'name': m.title,
+    'description': `Prediction market: 是 ${m.yesPct} · 否 ${m.noPct} on Polymarket.`,
+    'url': m.eventUrl,
+    'publisher': {
+      '@type': 'Organization',
+      'name': 'Polymarket',
+      'url': 'https://polymarket.com'
+    }
+  })
+}
 const aiSummary = ref(``)
 const aiSummaryTime = ref("")
 const modelName = ref("")
@@ -70,6 +144,7 @@ const question = ref(``)
 const aiConfigId = ref(null)
 const sysPromptId = ref(null)
 const loading = ref(true)
+const analysisStatus = ref('')
 const aiConfigs = ref([])
 const sysPromptOptions = ref([])
 const userPromptOptions = ref([])
@@ -151,6 +226,7 @@ onBeforeUnmount(() => {
   EventsOff("newTelegraph")
   EventsOff("newSinaNews")
   EventsOff("summaryStockNews")
+  resetSummaryBuffer()
   stopTradingTimers()
   if (tradingCheckInterval.value) {
     clearInterval(tradingCheckInterval.value)
@@ -256,11 +332,40 @@ function industryRank() {
   })
 }
 
+let analysisFailed = false
+
+// 中断状态跟踪：isSummaryStreaming 表示当前有进行中的总结流（控制"中断"按钮显隐）；
+// cancelledOldPending 标记"再次总结"刚取代了旧流，下一条 CANCELLED 属于旧流的退出通知，
+// 不应把新请求的界面状态误标为"已中断"。
+const isSummaryStreaming = ref(false)
+let cancelledOldPending = false
+
+const SUMMARY_EVENT = "summaryStockNews"
+
+// 合约行情相关页签（永续合约/美股永续/美股合约）仅在定制版本编译（wails build -tags custom）下显示
+const isCustomBuild = ref(false)
+GetVersionInfo().then(result => {
+  isCustomBuild.value = result.customBuild === true
+}).catch(err => {
+  console.error("GetVersionInfo error:", err)
+})
+
+function abortSummary() {
+  if (!isSummaryStreaming.value) return
+  AbortSummaryStockNewsByEvent(SUMMARY_EVENT)
+  // 界面状态由后端推送的 CANCELLED 事件统一收尾
+}
+
 function reAiSummary() {
+  resetSummaryBuffer()
   aiSummary.value = ""
+  analysisFailed = false
   summaryModal.value = true
   loading.value = true
-  SummaryStockNews(question.value,aiConfigId.value, sysPromptId.value,enableTools.value,thinkingMode.value,"summaryStockNews","")
+  analysisStatus.value = "正在连接AI服务..."
+  isSummaryStreaming.value = true
+  cancelledOldPending = true
+  SummaryStockNews(question.value,aiConfigId.value, sysPromptId.value,enableTools.value,thinkingMode.value,SUMMARY_EVENT,"","","")
 }
 
 function getAiSummary() {
@@ -296,13 +401,90 @@ function updateTab(name) {
   nowTab.value = name
 }
 
-EventsOn("summaryStockNews", async (msg) => {
+// 流式输出缓冲：AI 总结每秒可能推送数十条增量，逐条写入 aiSummary 会让 MdPreview
+// 整篇重新解析 markdown（输出越长越卡），这里按固定间隔合并刷新，内容顺序不变，
+// 渲染次数降到每秒 8 次左右。
+const SUMMARY_FLUSH_INTERVAL = 120
+let summaryBuffer = ""
+let summaryFlushTimer = null
+
+function flushSummaryBuffer() {
+  if (summaryFlushTimer) {
+    clearTimeout(summaryFlushTimer)
+    summaryFlushTimer = null
+  }
+  if (!summaryBuffer) return
+  aiSummary.value += summaryBuffer
+  summaryBuffer = ""
+  scrollToAiResultBottom()
+}
+
+function appendSummaryChunk(text) {
+  summaryBuffer += text
+  if (!summaryFlushTimer) {
+    summaryFlushTimer = setTimeout(flushSummaryBuffer, SUMMARY_FLUSH_INTERVAL)
+  }
+}
+
+function resetSummaryBuffer() {
+  if (summaryFlushTimer) {
+    clearTimeout(summaryFlushTimer)
+    summaryFlushTimer = null
+  }
+  summaryBuffer = ""
+}
+
+EventsOn(SUMMARY_EVENT, async (msg) => {
   if (msg === "DONE") {
-    await SaveAIResponseResult("市场资讯", "市场资讯", aiSummary.value, chatId.value, question.value,aiConfigId.value)
-    message.info("AI分析完成！")
-    message.destroyAll()
+    // 结束前先落盘缓冲区，保证保存/展示的内容完整
+    flushSummaryBuffer()
     loading.value = false
+    isSummaryStreaming.value = false
+    cancelledOldPending = false
+    message.destroyAll()
+    if (analysisFailed) {
+      // 分析过程出错（网络/模型服务/超时），不能提示"分析完成"，也不保存错误内容
+      analysisStatus.value = "分析出错"
+      notify.error({
+        title: 'AI分析出错',
+        content: '分析中断或模型服务返回错误，详见分析内容',
+        duration: 5000,
+      })
+    } else {
+      await SaveAIResponseResult("市场资讯", "市场资讯", aiSummary.value, chatId.value, question.value,aiConfigId.value)
+      analysisStatus.value = "分析完成"
+      notify.success({
+        title: 'AI分析完成',
+        content: '市场资讯分析已完成',
+        duration: 3000,
+      })
+    }
+    setTimeout(() => {
+      analysisStatus.value = ""
+    }, 3000)
+  } else if (msg === "CANCELLED") {
+    // 当前请求被取消：
+    // - cancelledOldPending：刚点了"再次总结"，这条是旧流的退出通知，静默忽略
+    // - 否则为手动中断：结束加载状态；已有内容则标记中断，内容为空也要停掉加载防止一直转圈
+    if (cancelledOldPending) {
+      cancelledOldPending = false
+      return
+    }
+    flushSummaryBuffer()
+    isSummaryStreaming.value = false
+    loading.value = false
+    analysisStatus.value = "分析已被中断"
+    setTimeout(() => {
+      if (analysisStatus.value === "分析已被中断") {
+        analysisStatus.value = ""
+      }
+    }, 3000)
   } else {
+    if (msg.code === 0) {
+      // 后端标记的错误消息（网络/HTTP/超时等），不再以"分析完成"收场
+      analysisFailed = true
+    }
+    cancelledOldPending = false
     if (msg.chatId) {
       chatId.value = msg.chatId
     }
@@ -310,16 +492,19 @@ EventsOn("summaryStockNews", async (msg) => {
       question.value = msg.question
     }
     if (msg.content || msg.reasoning_content || msg.extraContent) {
+      if (!aiSummary.value) {
+        analysisStatus.value = "AI正在分析中..."
+      }
       loading.value = false
     }
     if (msg.content) {
-      aiSummary.value = aiSummary.value + msg.content
+      appendSummaryChunk(msg.content)
     }
     if (msg.reasoning_content) {
-      aiSummary.value = aiSummary.value + msg.reasoning_content
+      appendSummaryChunk(msg.reasoning_content)
     }
     if (msg.extraContent) {
-      aiSummary.value = aiSummary.value + msg.extraContent
+      appendSummaryChunk(msg.extraContent)
     }
     if (msg.model) {
       modelName.value = msg.model
@@ -327,7 +512,6 @@ EventsOn("summaryStockNews", async (msg) => {
     if (msg.time) {
       aiSummaryTime.value = msg.time
     }
-    scrollToAiResultBottom()
   }
 })
 
@@ -403,7 +587,7 @@ function ReFlesh(source) {
       <n-tab-pane name="市场快讯" tab="市场快讯">
         <n-grid :cols="1" :y-gap="0">
           <n-gi>
-            <AnalyzeMartket :dark-theme="darkTheme" :chart-height="300" :kDays="1" :name="'最近24小时热词'" />
+            <AnalyzeMartket :dark-theme="darkTheme" :chart-height="300" />
           </n-gi>
           <n-gi>
             <n-grid :cols="foreignNewsList.length?3:2" :y-gap="0">
@@ -421,6 +605,9 @@ function ReFlesh(source) {
           </n-gi>
         </n-grid>
 
+      </n-tab-pane>
+      <n-tab-pane name="政策新闻" tab="政策新闻">
+        <PolicyNewsList/>
       </n-tab-pane>
       <n-tab-pane name="全球股指" tab="全球股指">
         <n-tabs type="segment" animated>
@@ -568,6 +755,9 @@ function ReFlesh(source) {
           </n-tab-pane>
         </n-tabs>
       </n-tab-pane>
+      <n-tab-pane name="期指多空" tab="期指多空">
+        <FuturesPositionChart variety="IF" :days="120" :chart-height="panelHeight-60" :dark-theme="true"/>
+      </n-tab-pane>
       <n-tab-pane name="行业排名" tab="行业排名">
         <n-tabs type="card" animated>
           <n-tab-pane name="行业涨幅排名" tab="行业涨幅排名">
@@ -700,8 +890,17 @@ function ReFlesh(source) {
           </n-tab-pane>
         </n-tabs>
       </n-tab-pane>
+      <n-tab-pane name="板块资金流向" tab="板块资金流向">
+        <BKFundFlowChart :dark-theme="darkTheme" :chart-height="600"/>
+      </n-tab-pane>
+      <n-tab-pane name="概念资金流向" tab="概念资金流向">
+        <ConceptFundFlowChart :dark-theme="darkTheme" :chart-height="600"/>
+      </n-tab-pane>
       <n-tab-pane name="龙虎榜" tab="龙虎榜">
         <LongTigerRankList />
+      </n-tab-pane>
+      <n-tab-pane name="游资动向" tab="游资动向">
+        <LhbHotMoneyDaily />
       </n-tab-pane>
       <n-tab-pane name="个股研报" tab="个股研报">
         <StockResearchReportList :stock-code="stockCode"/>
@@ -726,6 +925,15 @@ function ReFlesh(source) {
           <n-tab-pane name="美股" tab="美股">
             <HotStockList :market-type="'11'"/>
           </n-tab-pane>
+          <n-tab-pane v-if="!isCustomBuild" name="永续合约" tab="永续合约">
+            <BinanceFuturesList :dark-theme="darkTheme" market="crypto"/>
+          </n-tab-pane>
+          <n-tab-pane v-if="!isCustomBuild" name="美股永续" tab="美股永续">
+            <BinanceFuturesList :dark-theme="darkTheme" market="tradfi"/>
+          </n-tab-pane>
+          <n-tab-pane v-if="!isCustomBuild" name="美股合约" tab="美股合约">
+            <BitgetFuturesList :dark-theme="darkTheme"/>
+          </n-tab-pane>
           <n-tab-pane name="热门话题" tab="热门话题">
             <n-grid :cols="1" :y-gap="10">
               <n-grid-item>
@@ -742,16 +950,69 @@ function ReFlesh(source) {
           <n-tab-pane name="财经日历" tab="财经日历">
             <ClsCalendarTimeLine />
           </n-tab-pane>
+          <n-tab-pane name="每日炒作题材" tab="每日炒作题材">
+            <ConceptEventList />
+          </n-tab-pane>
+          <n-tab-pane name="PolyMarket预测" tab="PolyMarket预测">
+            <n-grid :cols="2" :x-gap="12" :y-gap="12" responsive="screen" style="--wails-draggable:no-drag">
+              <n-grid-item v-for="m in polymarketMarkets" :key="m.marketSlug">
+                <n-card :title="m.title" size="small" style="height:100%">
+                  <component :is="'script'" type="application/ld+json" v-html="polymarketLdJson(m)"></component>
+                  <div style="display:flex;justify-content:center">
+                    <figure
+                      class="polymarket-embed"
+                      :aria-label="`Polymarket prediction market: ${m.title}`"
+                      style="position:relative;display:inline-block;margin:0"
+                    >
+                      <iframe
+                        :title="`${m.title} — Polymarket Prediction Market`"
+                        :src="polymarketSrc(m)"
+                        width="400"
+                        height="300"
+                        frameborder="0"
+                        allowtransparency="true"
+                      ></iframe>
+                      <a
+                        :href="m.eventUrl"
+                        aria-label="View on Polymarket"
+                        target="_blank"
+                        rel="noopener"
+                        style="position:absolute;top:16px;right:20px;width:120px;height:24px;z-index:10"
+                      ></a>
+                      <figcaption style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0">
+                        <strong>{{ m.title }}</strong><br>
+                        是 {{ m.yesPct }} · 否 {{ m.noPct }}<br>
+                        <a :href="m.eventUrl">
+                          View full market &amp; trade on Polymarket
+                        </a>
+                      </figcaption>
+                    </figure>
+                  </div>
+                </n-card>
+              </n-grid-item>
+            </n-grid>
+            <n-card title="Polymarket 财经市场" size="small" style="margin-top:12px;--wails-draggable:no-drag">
+              <n-flex justify="center" align="center" :wrap="false" style="gap:12px">
+                <n-text depth="2">polymarket.com 拒绝 iframe 嵌入，点击下方按钮在外部浏览器打开</n-text>
+                <n-button type="info" size="small" @click="OpenURL('https://polymarket.com/zh/finance')">
+                  打开 Polymarket 财经市场
+                </n-button>
+              </n-flex>
+            </n-card>
+          </n-tab-pane>
         </n-tabs>
       </n-tab-pane>
       <n-tab-pane name="名站优选" tab="名站优选">
         <Stockhotmap />
       </n-tab-pane>
+      <n-tab-pane name="融资融券" tab="融资融券">
+        <RzrqRank :dark-theme="darkTheme"/>
+      </n-tab-pane>
     </n-tabs>
   </n-card>
   <n-modal transform-origin="center" v-model:show="summaryModal" preset="card" style="width: 800px;max-width: calc(100vw - 32px);"
            :title="'AI市场资讯总结'">
-    <n-spin size="small" :show="loading">
+    <n-spin size="small" :show="loading && !aiSummary">
       <div ref="aiResultScrollRef" style="height: 440px;max-height: 60vh;text-align: left;overflow-y: auto;">
         <MdPreview ref="mdPreviewRef" :modelValue="aiSummary" :theme="theme"/>
       </div>
@@ -762,6 +1023,7 @@ function ReFlesh(source) {
           <n-tag v-if="modelName" type="warning" round :title="chatId" :bordered="false">{{ modelName }}</n-tag>
           {{ aiSummaryTime }}
         </n-text>
+        <n-text type="success" v-if="analysisStatus">{{ analysisStatus }}</n-text>
         <n-text type="error">*AI分析结果仅供参考，请以实际行情为准。投资需谨慎，风险自担。</n-text>
       </n-flex>
     </template>
@@ -806,6 +1068,7 @@ function ReFlesh(source) {
             }"
         />
         <n-button size="tiny" type="warning" @click="reAiSummary">再次总结</n-button>
+        <n-button v-if="isSummaryStreaming" size="tiny" type="error" @click="abortSummary">中断</n-button>
         <n-button size="tiny" type="success" @click="copyToClipboard">复制到剪切板</n-button>
         <n-button size="tiny" type="primary" @click="saveAsMarkdown">保存为Markdown文件</n-button>
         <n-button size="tiny" type="error" @click="share">分享到项目社区</n-button>

@@ -1,5 +1,5 @@
 <script setup>
-import { h, onMounted, onUnmounted, ref, reactive } from 'vue'
+import { h, onMounted, onUnmounted, ref, reactive, watch } from 'vue'
 import {
   AddTradingRecord,
   GetTradingRecordList,
@@ -9,7 +9,9 @@ import {
   CheckFrequentTrading,
   GetAllStockInfoList,
   GetStockRealTimePrice,
-  GetConfig
+  GetConfig,
+  ImportTradingRecordsFromExcel,
+  ExportTradingRecordTemplate
 } from '../../wailsjs/go/main/App'
 import {
   NButton,
@@ -23,6 +25,7 @@ import {
   NInputNumber,
   NModal,
   NNumberAnimation,
+  NPopconfirm,
   NSelect,
   NSpace,
   NStatistic,
@@ -34,6 +37,7 @@ import {
 } from 'naive-ui'
 import sparkLine from "./stockSparkLine.vue";
 import StockLightweightKlineChart from "./StockLightweightKlineChart.vue";
+import { KLINE_MODAL_CONTENT_STYLE, KLINE_MODAL_STYLE, useKlineModalFit } from "./kline/useKlineModalFit";
 import { GetEffectiveSponsorVip } from '../../wailsjs/go/main/App'
 
 const message = useMessage()
@@ -43,6 +47,16 @@ const vipLevel = ref(0)
 const showKlineModal = ref(false)
 const klineStockCode = ref('')
 const klineStockName = ref('')
+// K 线弹窗尺寸与图表高度自适应：与全站其他 K 线弹窗统一
+const klineWrapRef = ref(null)
+const { chartHeight: klineChartHeight, attach: attachKlineFit, detach: detachKlineFit } = useKlineModalFit(klineWrapRef)
+watch(showKlineModal, (v) => {
+  if (v) {
+    attachKlineFit()
+    return
+  }
+  detachKlineFit()
+})
 const longStopLossPrice = ref(0)
 const longTakeProfitPrice = ref(0)
 const costPrice = ref(0)
@@ -259,22 +273,26 @@ function openKlineChart(row) {
 
 
 function formatRowTradingTime(row) {
-  console.log('formatRowTradingTime:', row)
   const t = row.TradingTime
   if (t == null || t === '') return '-'
   let date
-  if (typeof t === 'string' && t.length >= 19 && t.includes('T')) {
-    date = new Date(t.substring(0, 19).replace('T', ' ') + ' UTC')
-  } else if (typeof t === 'string') {
-    date = new Date(t)
+  // 后端 time.Time 通过 Wails/JSON 序列化为 RFC3339 UTC 字符串（带 T 与 Z/+08:00）
+  // 这里按本地时区展示，避免硬编码 UTC+8 导致非东八区显示错误
+  if (typeof t === 'string') {
+    if (t.length >= 19 && t.includes('T')) {
+      // 已带时区信息的 ISO 字符串，直接 new Date 即可正确解析
+      date = new Date(t)
+    } else {
+      // 不带时区的字符串（如 "2026-01-01 12:00:00"）按本地时间解析
+      const normalized = t.replace(' ', 'T')
+      date = new Date(normalized)
+    }
   } else {
     date = new Date(t)
   }
-  const utc8Offset = 8 * 60 * 60 * 1000
-  const localOffset = date.getTimezoneOffset() * 60 * 1000
-  const utc8Time = new Date(date.getTime() + utc8Offset - localOffset)
+  if (isNaN(date.getTime())) return '-'
   const pad = (n) => String(n).padStart(2, '0')
-  return `${utc8Time.getFullYear()}-${pad(utc8Time.getMonth() + 1)}-${pad(utc8Time.getDate())} ${pad(utc8Time.getHours())}:${pad(utc8Time.getMinutes())}:${pad(utc8Time.getSeconds())}`
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
 /** 统一列表行字段（Wails/JSON 可能为 PascalCase），供表格渲染与刷新使用 */
@@ -382,10 +400,22 @@ function handleSearch() {
   fetchStatistics()
 }
 
+// 关键词输入防抖触发搜索（避免逐字请求），与按钮搜索/回车搜索共用同一入口
+let searchDebounceTimer = null
+function debouncedSearch() {
+  if (searchDebounceTimer) {
+    clearTimeout(searchDebounceTimer)
+  }
+  searchDebounceTimer = setTimeout(() => {
+    searchDebounceTimer = null
+    handleSearch()
+  }, 400)
+}
+
 function fetchStatistics() {
+  // 统计始终基于全部历史记录，不受列表筛选影响，确保总盈亏与当日盈亏真实准确
   GetTradingRecordStatistics()
     .then((res) => {
-      console.log('统计数据返回:', res)
       if (res) {
         statisticsRef.value = res
       }
@@ -428,7 +458,36 @@ function openEditModal(row) {
   showEditModal.value = true
 }
 
+function validateFormData() {
+  if (!formData.StockCode || !String(formData.StockCode).trim()) {
+    message.warning('请输入股票代码')
+    return false
+  }
+  if (!formData.StockName || !String(formData.StockName).trim()) {
+    message.warning('请输入股票名称')
+    return false
+  }
+  if (formData.Direction !== '买入' && formData.Direction !== '卖出') {
+    message.warning('请选择交易方向')
+    return false
+  }
+  if (!(formData.Price > 0)) {
+    message.warning('价格必须大于0')
+    return false
+  }
+  if (!(formData.Volume > 0)) {
+    message.warning('成交数量必须大于0')
+    return false
+  }
+  if (formData.Fee < 0) {
+    message.warning('手续费不能为负数')
+    return false
+  }
+  return true
+}
+
 function handleAdd() {
+  if (!validateFormData()) return
   const run = () => {
     formData.Amount = formData.Price * formData.Volume
     AddTradingRecord({
@@ -448,12 +507,11 @@ function handleAdd() {
   if (formData.Direction === '买入' && formData.StockCode) {
     CheckFrequentTrading(formData.StockCode)
       .then((res) => {
-        console.log('检查频繁交易结果:', res)
         const canTrade = res.canTrade
         const msg = res.msg
         if (!canTrade) {
+          // 仅提示用户频繁交易风险，不阻止继续添加
           message.warning(msg)
-          return
         }
         run()
       })
@@ -467,6 +525,7 @@ function handleAdd() {
 }
 
 function handleUpdate() {
+  if (!validateFormData()) return
   formData.Amount = formData.Price * formData.Volume
   UpdateTradingRecord({
     ...formData,
@@ -490,6 +549,59 @@ function deleteTradingRecord(id) {
     })
     .catch((e) => {
       message.error(e?.message || '删除交易日志失败')
+    })
+}
+
+const importingRef = ref(false)
+
+// 导入指引弹窗：推荐券商导出 + 模板下载两种方式
+const showImportGuide = ref(false)
+
+function openImportGuide() {
+  showImportGuide.value = true
+}
+
+function confirmImportFromGuide() {
+  showImportGuide.value = false
+  handleImport()
+}
+
+function handleDownloadTemplate() {
+  ExportTradingRecordTemplate()
+    .then((path) => {
+      if (!path) return // 用户取消保存
+      message.success('模板已保存：' + path)
+    })
+    .catch((e) => {
+      message.error(e?.message || '保存模板失败')
+    })
+}
+
+function handleImport() {
+  if (importingRef.value) return
+  importingRef.value = true
+  ImportTradingRecordsFromExcel()
+    .then((res) => {
+      if (!res) {
+        // 用户取消选择文件
+        return
+      }
+      if (res.imported > 0) {
+        notify.success({ content: res.message || '导入完成', duration: 3000 })
+      } else if (res.total === 0) {
+        message.warning('文件中没有可导入的交易记录')
+      } else if (res.imported === 0 && res.failed === 0) {
+        message.info(res.message || '没有新增记录（均已存在）')
+      } else {
+        message.warning(res.message || '导入完成')
+      }
+      handleSearch()
+    })
+    .catch((e) => {
+      message.error(e?.message || '导入交易记录失败')
+    })
+    .finally(() => {
+      importingRef.value = false
     })
 }
 
@@ -545,7 +657,7 @@ const columnsRef = ref([
     }
   },
   {
-    title: '收盘/最新价',
+    title: '当日收盘',
     key: 'closePrice',
     width: 100,
     render(row) {
@@ -606,7 +718,7 @@ const columnsRef = ref([
   },
   {
     title: '操作',
-    width: 200,
+    width: 220,
     render(row) {
       return [
         h(
@@ -630,14 +742,22 @@ const columnsRef = ref([
           { default: () => '编辑' }
         ),
         h(
-          NTag,
+          NPopconfirm,
           {
-            strong: true,
-            tertiary: true,
-            type: 'error',
-            onClick: () => deleteTradingRecord(row.ID)
+            onPositiveClick: () => deleteTradingRecord(row.ID)
           },
-          { default: () => '删除' }
+          {
+            trigger: () => h(
+              NTag,
+              {
+                strong: true,
+                tertiary: true,
+                type: 'error'
+              },
+              { default: () => '删除' }
+            ),
+            default: () => '确定删除该条交易日志？删除后不可恢复。'
+          }
         )
       ]
     }
@@ -689,21 +809,39 @@ onUnmounted(() => {
 
 <template>
   <n-input-group>
-    <n-date-picker v-model:value="paginationReactive.range" type="daterange" style="width: 40%" />
+    <n-date-picker
+      v-model:value="paginationReactive.range"
+      type="daterange"
+      style="width: 40%"
+      @update:value="handleSearch"
+    />
     <n-select
       v-model:value="paginationReactive.direction"
       :options="directionOptions"
       placeholder="交易方向"
       style="width: 15%"
       clearable
+      @update:value="handleSearch"
     />
-    <n-input clearable placeholder="股票代码 / 名称" v-model:value="paginationReactive.keyword" />
+    <n-input
+      clearable
+      placeholder="股票代码 / 名称"
+      v-model:value="paginationReactive.keyword"
+      @update:value="debouncedSearch"
+      @keyup.enter="handleSearch"
+    />
     <n-button type="primary" ghost @click="handleSearch">搜索</n-button>
     <n-button @click="resetFilter">重置</n-button>
     <n-button type="primary" ghost @click="openAddModal">添加记录</n-button>
+    <n-button :loading="importingRef" type="primary" secondary @click="openImportGuide">导入记录</n-button>
   </n-input-group>
 
-  <n-grid :cols="6" :x-gap="12" style="margin-top: 12px; padding: 12px; border-radius: 4px">
+  <n-grid :cols="7" :x-gap="12" style="margin-top: 12px; padding: 12px; border-radius: 4px">
+    <n-grid-item>
+      <n-statistic label="持仓股票数">
+        <n-number-animation :from="0" :to="statisticsRef?.stockCount || 0" :precision="0" />
+      </n-statistic>
+    </n-grid-item>
     <n-grid-item>
       <n-statistic label="持仓金额(元)">
         <n-number-animation :from="0" :to="statisticsRef?.holdingsAmount || 0" :precision="2" />
@@ -742,6 +880,47 @@ onUnmounted(() => {
     </n-grid-item>
   </n-grid>
 
+  <n-grid :cols="6" :x-gap="12" style="margin-top: 4px; padding: 0 12px 12px; border-radius: 4px">
+    <n-grid-item>
+      <n-statistic label="当日买入(元)">
+        <n-number-animation :from="0" :to="statisticsRef?.todayBuyAmount || 0" :precision="2" />
+      </n-statistic>
+    </n-grid-item>
+    <n-grid-item>
+      <n-statistic label="当日卖出(元)">
+        <n-number-animation :from="0" :to="statisticsRef?.todaySellAmount || 0" :precision="2" />
+      </n-statistic>
+    </n-grid-item>
+    <n-grid-item>
+      <n-statistic label="当日已实现(元)">
+        <n-text :type="statisticsRef?.todayRealizedProfit > 0 ? 'error' : 'success'">
+          <n-number-animation :from="0" :to="statisticsRef?.todayRealizedProfit || 0" :precision="2" />
+        </n-text>
+      </n-statistic>
+    </n-grid-item>
+    <n-grid-item>
+      <n-statistic label="当日浮动(元)">
+        <n-text :type="statisticsRef?.todayFloatingProfit > 0 ? 'error' : 'success'">
+          <n-number-animation :from="0" :to="statisticsRef?.todayFloatingProfit || 0" :precision="2" />
+        </n-text>
+      </n-statistic>
+    </n-grid-item>
+    <n-grid-item>
+      <n-statistic label="当日盈亏(元)">
+        <n-text :type="statisticsRef?.todayProfit > 0 ? 'error' : 'success'">
+          <n-number-animation :from="0" :to="statisticsRef?.todayProfit || 0" :precision="2" />
+        </n-text>
+      </n-statistic>
+    </n-grid-item>
+    <n-grid-item>
+      <n-statistic label="当日收益率">
+        <n-text :type="statisticsRef?.todayProfitRate > 0 ? 'error' : 'success'">
+          <n-number-animation :from="0" :to="statisticsRef?.todayProfitRate || 0" :precision="2" />%
+        </n-text>
+      </n-statistic>
+    </n-grid-item>
+  </n-grid>
+
   <n-data-table
     remote
     size="small"
@@ -752,7 +931,7 @@ onUnmounted(() => {
     :row-key="(rowData) => rowData.ID"
     @update:page="handlePageChange"
     flex-height
-    style="height: calc(100vh - 310px); margin-top: 10px"
+    style="height: calc(100vh - 370px); margin-top: 10px"
   />
 
   <n-modal v-model:show="showAddModal" preset="card" title="添加交易日志" style="width: 820px;max-width: calc(100vw - 32px);">
@@ -935,16 +1114,45 @@ onUnmounted(() => {
     </template>
   </n-modal>
 
-  <n-modal v-model:show="showKlineModal" preset="card" :title="'K线 - ' + klineStockName" style="width: 95vw; max-width: 1400px">
-    <StockLightweightKlineChart
-      :code="klineStockCode"
-      :stock-name="klineStockName"
-      :chart-height="500"
-      :dark-theme="darkTheme"
-      :longStopLossPrice="longStopLossPrice"
-      :longTakeProfitPrice="longTakeProfitPrice"
-      :costPrice="costPrice"
-    />
+  <n-modal v-model:show="showKlineModal" preset="card" :title="'K线 - ' + klineStockName" :style="KLINE_MODAL_STYLE" :content-style="KLINE_MODAL_CONTENT_STYLE">
+    <div ref="klineWrapRef">
+      <StockLightweightKlineChart
+        :code="klineStockCode"
+        :stock-name="klineStockName"
+        :chart-height="klineChartHeight"
+        :dark-theme="darkTheme"
+        :longStopLossPrice="longStopLossPrice"
+        :longTakeProfitPrice="longTakeProfitPrice"
+        :costPrice="costPrice"
+      />
+    </div>
+  </n-modal>
+
+  <!-- 导入指引：推荐从券商软件导出历史成交；也支持下载模板手工填写 -->
+  <n-modal v-model:show="showImportGuide" preset="card" title="导入交易记录" style="width: min(560px, 92vw)">
+    <div style="display: flex; flex-direction: column; gap: 12px; text-align: left;">
+      <div>
+        <div style="font-weight: bold; margin-bottom: 4px;">方式一：从券商软件导出（推荐）</div>
+        <div style="color: var(--n-text-color-3, #888); font-size: 13px; line-height: 1.8;">
+          在券商App/PC交易软件中找到「历史成交」或「交割单」（一般在 交易 → 查询 菜单下），
+          选择日期区间后导出为 .xls/.xlsx/.csv 文件（Excel 或表格文本均可），再点击下方「选择文件导入」。
+          支持GBK/UTF-8编码，重复记录会自动跳过，可放心多次导入。
+          <br />
+          东方财富：「查询 → 成交查询」与「查询 → 交割单」两种导出均已适配（兼容 发生日期、买卖标志、业务名称、
+          成交价格、佣金、过户费等列名）；同一批交易请只用一个入口导出，避免被当作两批记录重复入库。
+        </div>
+      </div>
+      <div>
+        <div style="font-weight: bold; margin-bottom: 4px;">方式二：下载模板手工填写</div>
+        <div style="color: var(--n-text-color-3, #888); font-size: 13px; line-height: 1.8;">
+          模板为 Excel（.xlsx）文件，含「使用说明」与「交易记录」两个工作表，按示例格式填写后直接导入。
+        </div>
+      </div>
+      <n-space justify="end" style="margin-top: 4px;">
+        <n-button quaternary @click="handleDownloadTemplate">下载模板</n-button>
+        <n-button type="primary" @click="confirmImportFromGuide">选择文件导入</n-button>
+      </n-space>
+    </div>
   </n-modal>
 </template>
 

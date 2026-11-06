@@ -8,30 +8,31 @@ import {
   WindowUnfullscreen,
   WindowSetTitle
 } from '../wailsjs/runtime'
-import {h, onBeforeMount, onBeforeUnmount, onMounted, ref} from "vue";
-import {RouterLink, useRouter} from 'vue-router'
-import {createDiscreteApi,darkTheme,lightTheme , NIcon, NText,NButton,dateZhCN,zhCN} from 'naive-ui'
+import {h, onBeforeMount, onBeforeUnmount, onMounted, ref, watch} from "vue";
+import {RouterLink, useRoute, useRouter} from 'vue-router'
+import {createDiscreteApi,darkTheme,lightTheme , NIcon, NText,NButton,NProgress,dateZhCN,zhCN} from 'naive-ui'
 import {
   AlarmOutline,
   AnalyticsOutline,
-  BarChartSharp, Bonfire, BonfireOutline, DiamondOutline, EaselSharp,
+  BarChartSharp, Bonfire, BonfireOutline, BookOutline, CalendarOutline, DiamondOutline, DocumentTextOutline, EaselSharp,
   ExpandOutline, Flag,
-  Flame, FlameSharp, FlaskOutline, GlobeOutline, InformationOutline,
+  Flame, FlameSharp, FlaskOutline, GlobeOutline, HomeOutline, InformationOutline,
   LogoGithub,
   ChatbubblesOutline,
   NewspaperOutline,
   NewspaperSharp, Notifications,
   PowerOutline, Pulse,
   ReorderTwoOutline,
-  SettingsOutline, ServerOutline, Skull, SkullOutline, SkullSharp,
+  SettingsOutline, ServerOutline, ScaleOutline, Skull, SkullOutline, SkullSharp,
   SparklesOutline, FlashOutline, Star,
   StarOutline,
-  StatsChartOutline,
-  Wallet, WarningOutline, TimeOutline, SearchOutline,
+  StatsChartOutline, SwapHorizontalOutline,
+  Wallet, WarningOutline, TimeOutline, SearchOutline, BookmarkOutline,
 } from '@vicons/ionicons5'
-import {AnalyzeSentiment, GetConfig, GetGroupList, GetVersionInfo, IsTradingTime, IsHKTradingTime, IsUSTradingTime} from "../wailsjs/go/main/App";
+import {AnalyzeSentiment, GetConfig, GetEffectiveSponsorVip, GetGroupList, GetVersionInfo, IsTradingTime, IsHKTradingTime, IsUSTradingTime, RestartApp} from "../wailsjs/go/main/App";
 import FloatingAiAssistant from "./components/FloatingAiAssistant.vue";
 import FloatingAgentAssistant from "./components/FloatingAgentAssistant.vue";
+import SignalMonitorPanel from "./components/SignalMonitorPanel.vue";
 import {Dragon, Fire, FirefoxBrowser, Gripfire, Robot} from "@vicons/fa";
 import {Prompt, ReportAnalytics, ReportMoney, ReportSearch, TrendingUp} from "@vicons/tabler";
 import {LocalFireDepartmentRound} from "@vicons/material";
@@ -47,11 +48,22 @@ const loadingMsg = ref("加载数据中...")
 const enableNews = ref(false)
 const contentStyle = ref("")
 const enableFund = ref(false)
+// 「合约行情」菜单显隐：custom 编译隐藏（与"关于"页面同方向）；普通编译下
+// 受设置页「启用合约行情」开关（enableContracts）控制
+const enableContracts = ref(true)
+const isCustomBuild = ref(false)
 const enableAgent = ref(false)
-const enableDarkTheme = ref(null)
+const enableDarkTheme = ref(darkTheme)
 const content = ref('未经授权,禁止商业目的!\n\n数据来源于网络,仅供参考;投资有风险,入市需谨慎')
 const isFullscreen = ref(false)
-const activeKey = ref('stock')
+const activeKey = ref('home')
+const route = useRoute()
+// 路由变化时同步菜单高亮（如重定向、前进/后退）
+watch(() => route.name, (name) => {
+  if (name && typeof name === 'string') {
+    activeKey.value = name
+  }
+})
 const containerRef = ref({})
 const realtimeProfit = ref(0)
 const telegraph = ref([])
@@ -59,6 +71,53 @@ const groupList = ref([])
 const officialStatement= ref("")
 const marketStatus = ref('')
 let marketStatusTimer = null
+
+const downloadState = ref({
+  active: false, percentage: 0, speed: 0, avgSpeed: 0,
+  downloaded: 0, total: 0, version: '', proxy: '',
+  proxySpeed: 0, message: '', retrying: false,
+})
+let downloadNotification = null
+
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let val = bytes, i = 0
+  while (val >= 1024 && i < units.length - 1) { val /= 1024; i++ }
+  return val.toFixed(2) + ' ' + units[i]
+}
+function formatSpeed(bps) {
+  if (!bps || bps <= 0) return '0 B/s'
+  return formatBytes(bps) + '/s'
+}
+function renderDownloadContent() {
+  const children = []
+  if (downloadState.value.message) {
+    children.push(h('div', {
+      style: { 'margin-bottom': '8px', 'color': '#999', 'font-size': '12px', 'white-space': 'pre-wrap', 'max-height': '120px', 'overflow': 'hidden' }
+    }, { default: () => downloadState.value.message }))
+  }
+  children.push(h(NProgress, {
+    type: 'line',
+    status: downloadState.value.retrying ? 'warning' : 'success',
+    percentage: Math.round(downloadState.value.percentage),
+    showIndicator: false,
+    height: 8,
+    borderRadius: 4,
+  }))
+  const detail = downloadState.value.retrying
+    ? '正在尝试其他下载源...'
+    : `${formatBytes(downloadState.value.downloaded)} / ${formatBytes(downloadState.value.total)} · ${formatSpeed(downloadState.value.speed)}`
+  children.push(h('div', {
+    style: { 'margin-top': '6px', 'font-size': '12px', 'color': '#888' }
+  }, { default: () => detail }))
+  if (downloadState.value.proxy) {
+    children.push(h('div', {
+      style: { 'margin-top': '2px', 'font-size': '11px', 'color': '#aaa' }
+    }, { default: () => `下载源: ${downloadState.value.proxy}` }))
+  }
+  return h('div', { style: { 'text-align': 'left', 'font-size': '14px', 'min-width': '280px' } }, { default: () => children })
+}
 
 const investmentMottos = [
   "投资有风险，入市需谨慎",
@@ -102,7 +161,67 @@ function updateMarketStatus() {
     WindowSetTitle("go-stock " + marketStatus.value + " " + officialStatement.value + "  「" + currentMotto.value + "」  [数据来源于网络，仅供参考；投资有风险，入市需谨慎]")
   })
 }
+
+/** 用于功能权限：仅在赞助有效期内为解密等级，否则为 0（与 EffectiveSponsorVipStatus 一致） */
+const vipLevel = ref(0)
+/** 未生效原因，用于向用户解释为什么 VIP2 权益仍被拦截（如"尚未生效/已到期"） */
+const vipInactiveReason = ref('')
+let discreteMessage = null
+function getDiscreteMessage() {
+  if (!discreteMessage) {
+    discreteMessage = createDiscreteApi(['message'], {
+      configProviderProps: {
+        theme: enableDarkTheme.value ? darkTheme : lightTheme,
+      },
+    })
+  }
+  return discreteMessage.message
+}
+async function refreshEffectiveVip() {
+  try {
+    const r = await GetEffectiveSponsorVip()
+    const active = !!r?.active
+    const lvl = Number(r?.vipLevel ?? 0)
+    vipLevel.value = active && !Number.isNaN(lvl) ? lvl : 0
+    vipInactiveReason.value = active ? '' : String(r?.reason ?? '')
+  } catch (_) {
+    vipLevel.value = 0
+    vipInactiveReason.value = ''
+  }
+}
+async function handleKlineAnalysisClick() {
+  await refreshEffectiveVip()
+  if (vipLevel.value < 2) {
+    // 有赞助码但未生效时给出具体原因（如尚未生效 / 已到期 / 字段异常），
+    // 避免"关于页显示 VIP2，这里却只说需要升级"的认知冲突
+    getDiscreteMessage().warning(vipInactiveReason.value
+      ? `K线分析需要 VIP2 及以上有效赞助：${vipInactiveReason.value}`
+      : 'K线分析功能需要 VIP2 及以上赞助用户才能使用，请升级后体验')
+    return
+  }
+  activeKey.value = 'klineAnalysis'
+  router.push({ name: 'klineAnalysis' })
+}
+
 const menuOptions = ref([
+  {
+    label: () =>
+        h(
+            RouterLink,
+            {
+              to: {
+                name: 'home',
+                params: {},
+              },
+              onClick: () => {
+                activeKey.value = 'home'
+              },
+            },
+            {default: () => '首页',}
+        ),
+    key: 'home',
+    icon: renderIcon(HomeOutline),
+  },
   {
     label: () =>
         h(
@@ -128,29 +247,19 @@ const menuOptions = ref([
       {
         label: () =>
             h(
-                'a',
+                RouterLink,
                 {
-                  href: '#',
-                  type: 'info',
-                  onClick: () => {
-                    activeKey.value = 'stock'
-                    //console.log("push",item)
-                    router.push({
-                      name: 'stock',
-                      query: {
-                        groupName: '全部',
-                        groupId: 0,
-                      },
-                    })
-                    EventsEmit("changeTab", {ID: 0, name: '全部'})
-                  },
                   to: {
                     name: 'stock',
                     query: {
                       groupName: '全部',
                       groupId: 0,
                     },
-                  }
+                  },
+                  onClick: () => {
+                    activeKey.value = 'stock'
+                    EventsEmit("changeTab", {ID: 0, name: '全部'})
+                  },
                 },
                 {default: () => '全部',}
             ),
@@ -209,6 +318,28 @@ const menuOptions = ref([
                   to: {
                     name: 'market',
                     query: {
+                      name: "政策新闻",
+                    }
+                  },
+                  onClick: () => {
+                    activeKey.value = 'market'
+                    EventsEmit("changeMarketTab", {ID: 0, name: '政策新闻'})
+                  },
+                },
+                {default: () => '政策新闻',}
+            ),
+        key: 'market1_1',
+        icon: renderIcon(DocumentTextOutline),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  href: '#',
+                  to: {
+                    name: 'market',
+                    query: {
                       name: "全球股指",
                     },
                   },
@@ -243,6 +374,28 @@ const menuOptions = ref([
             ),
         key: 'market3',
         icon: renderIcon(AnalyticsOutline),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  href: '#',
+                  to: {
+                    name: 'market',
+                    query: {
+                      name: "期指多空",
+                    }
+                  },
+                  onClick: () => {
+                    activeKey.value = 'market'
+                    EventsEmit("changeMarketTab", {ID: 0, name: '期指多空'})
+                  },
+                },
+                {default: () => '期指多空',}
+            ),
+        key: 'market3_1',
+        icon: renderIcon(ScaleOutline),
       },
       {
         label: () =>
@@ -297,6 +450,50 @@ const menuOptions = ref([
                   to: {
                     name: 'market',
                     query: {
+                      name: "板块资金流向",
+                    }
+                  },
+                  onClick: () => {
+                    activeKey.value = 'market'
+                    EventsEmit("changeMarketTab", {ID: 0, name: '板块资金流向'})
+                  },
+                },
+                {default: () => '板块资金流向',}
+            ),
+        key: 'market5_1',
+        icon: renderIcon(ReportMoney),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  href: '#',
+                  to: {
+                    name: 'market',
+                    query: {
+                      name: "概念资金流向",
+                    }
+                  },
+                  onClick: () => {
+                    activeKey.value = 'market'
+                    EventsEmit("changeMarketTab", {ID: 0, name: '概念资金流向'})
+                  },
+                },
+                {default: () => '概念资金流向',}
+            ),
+        key: 'market5_2',
+        icon: renderIcon(TrendingUp),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  href: '#',
+                  to: {
+                    name: 'market',
+                    query: {
                       name: "龙虎榜",
                     }
                   },
@@ -309,6 +506,28 @@ const menuOptions = ref([
             ),
         key: 'market6',
         icon: renderIcon(Dragon),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  href: '#',
+                  to: {
+                    name: 'market',
+                    query: {
+                      name: "游资动向",
+                    }
+                  },
+                  onClick: () => {
+                    activeKey.value = 'market'
+                    EventsEmit("changeMarketTab", {ID: 0, name: '游资动向'})
+                  },
+                },
+                {default: () => '游资动向',}
+            ),
+        key: 'market6_1',
+        icon: renderIcon(Fire),
       },
       {
         label: () =>
@@ -420,24 +639,58 @@ const menuOptions = ref([
         key: 'market11',
         icon: renderIcon(FirefoxBrowser),
       },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  href: '#',
+                  to: {
+                    name: 'market',
+                    query: {
+                      name: "融资融券",
+                    }
+                  },
+                  onClick: () => {
+                    activeKey.value = 'market'
+                    EventsEmit("changeMarketTab", {ID: 0, name: '融资融券'})
+                  },
+                },
+                {default: () => '融资融券',}
+            ),
+        key: 'market12',
+        icon: renderIcon(Wallet),
+      },
     ]
+  },
+  {
+    label: () =>
+        h(
+            'div',
+            {
+              style: 'cursor: pointer; width: 100%;',
+              onClick: () => { handleKlineAnalysisClick() },
+            },
+            {default: () => 'K线分析'}
+        ),
+    key: 'klineAnalysis',
+    icon: renderIcon(StatsChartOutline),
   },
   {
     label: () =>
         h(
             RouterLink,
             {
-              to: {
-                name: 'klineAnalysis',
-              },
+              to: {name: 'contracts'},
               onClick: () => {
-                activeKey.value = 'klineAnalysis'
+                activeKey.value = 'contracts'
               },
             },
-            {default: () => 'K线分析'}
+            {default: () => '合约行情'}
         ),
-    key: 'klineAnalysis',
-    icon: renderIcon(StatsChartOutline),
+    show: !isCustomBuild.value && enableContracts.value,
+    key: 'contracts',
+    icon: renderIcon(SwapHorizontalOutline),
   },
   {
     label: () =>
@@ -491,6 +744,98 @@ const menuOptions = ref([
             ),
         key: 'fundRanking',
         icon: renderIcon(TrendingUp),
+      },
+    ]
+  },
+  {
+    label: () =>
+        h(
+            RouterLink,
+            {
+              to: {
+                name: 'dailyReview',
+                params: {},
+              },
+              onClick: () => {
+                activeKey.value = 'dailyReview'
+              },
+            },
+            {default: () => '复盘策略'}
+        ),
+    key: 'reviewStrategy',
+    icon: renderIcon(CalendarOutline),
+    children: [
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  to: {
+                    name: 'dailyReview',
+                    params: {},
+                  },
+                  onClick: () => {
+                    activeKey.value = 'dailyReview'
+                  },
+                },
+                {default: () => '每日复盘'}
+            ),
+        key: 'dailyReview',
+        icon: renderIcon(AnalyticsOutline),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  to: {
+                    name: 'morningStrategy',
+                    params: {},
+                  },
+                  onClick: () => {
+                    activeKey.value = 'morningStrategy'
+                  },
+                },
+                {default: () => '盘前策略'}
+            ),
+        key: 'morningStrategy',
+        icon: renderIcon(TimeOutline),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  to: {
+                    name: 'promptBacktest',
+                    params: {},
+                  },
+                  onClick: () => {
+                    activeKey.value = 'promptBacktest'
+                  },
+                },
+                {default: () => '提示词回测(beta)'}
+            ),
+        key: 'promptBacktest',
+        icon: renderIcon(StatsChartOutline),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  to: {
+                    name: 'recommendBacktestStats',
+                    params: {},
+                  },
+                  onClick: () => {
+                    activeKey.value = 'recommendBacktestStats'
+                  },
+                },
+                {default: () => '推荐回测统计'}
+            ),
+        key: 'recommendBacktestStats',
+        icon: renderIcon(AnalyticsOutline),
       },
     ]
   },
@@ -798,6 +1143,29 @@ const menuOptions = ref([
                   {
                     to: {
                       name: 'research',
+                      query: {
+                        name:"每日操作计划",
+                      },
+                    },
+                    onClick: () => {
+                      activeKey.value = 'research'
+                      setTimeout(() => {
+                        EventsEmit("changeResearchTab", {ID: 7, name: '每日操作计划'})
+                      }, 100)
+                    },
+                  },
+                  {default: () => '每日操作计划'}
+              ),
+          key: 'dailyOperationPlan',
+          icon: renderIcon(CalendarOutline),
+        },
+        {
+          label: () =>
+              h(
+                  RouterLink,
+                  {
+                    to: {
+                      name: 'research',
                     },
                     onClick: () => {
                       activeKey.value = 'research'
@@ -830,29 +1198,95 @@ const menuOptions = ref([
               ),
           key: 'skills',
           icon: renderIcon(FlashOutline),
-          show: false,
+        },
+        {
+          label: () =>
+              h(
+                  RouterLink,
+                  {
+                    to: {
+                      name: 'research',
+                    },
+                    onClick: () => {
+                      activeKey.value = 'research'
+                      setTimeout(() => {
+                        EventsEmit("changeResearchTab", {ID: 9, name: '知识库管理'})
+                      }, 100)
+                    },
+                  },
+                  {default: () => '知识库管理'}
+              ),
+          key: 'knowledgeBase',
+          icon: renderIcon(BookOutline),
         },
       ],
     },
   {
-    label: () =>
-        h(
-            RouterLink,
-            {
-              to: {
-                name: 'settings',
-                query: {
-                  name:"设置",
-                },
-                onClick: () => {
-                  activeKey.value = 'settings'
-                },
-              }
-            },
-            {default: () => '设置'}
-        ),
+    label: '设置',
     key: 'settings',
     icon: renderIcon(SettingsOutline),
+    children: [
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  to: {
+                    name: 'settings',
+                    query: {
+                      name:"设置",
+                    },
+                  },
+                  onClick: () => {
+                    activeKey.value = 'settings'
+                  },
+                },
+                {default: () => '基础设置'}
+            ),
+        key: 'settings',
+        icon: renderIcon(SettingsOutline),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  to: {
+                    name: 'aiConfigs',
+                    query: {
+                      name:"AI模型服务",
+                    },
+                  },
+                  onClick: () => {
+                    activeKey.value = 'aiConfigs'
+                  },
+                },
+                {default: () => 'AI模型服务'}
+            ),
+        key: 'aiConfigs',
+        icon: renderIcon(SparklesOutline),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  to: {
+                    name: 'userProfile',
+                    query: {
+                      name:"我的画像",
+                    },
+                  },
+                  onClick: () => {
+                    activeKey.value = 'userProfile'
+                  },
+                },
+                {default: () => '我的画像'}
+            ),
+        key: 'userProfile',
+        icon: renderIcon(BookmarkOutline),
+      },
+    ],
   },
   {
     label: () =>
@@ -911,6 +1345,46 @@ const menuOptions = ref([
     icon: renderIcon(PowerOutline),
   },
 ])
+
+// 重建"股票自选"菜单的分组子项（保留"全部"，用最新分组列表替换其余子项）
+function refreshStockGroupMenu() {
+  GetGroupList().then(result => {
+    groupList.value = result
+    menuOptions.value.forEach((item) => {
+      if (item.key === 'stock') {
+        const allItem = item.children.find(c => c.key === 0)
+        item.children = allItem ? [allItem] : []
+        item.children.push(...groupList.value.map(g => {
+          return {
+            label: () =>
+                h(
+                    RouterLink,
+                    {
+                      to: {
+                        name: 'stock',
+                        query: {
+                          groupName: g.name,
+                          groupId: g.ID,
+                        },
+                      },
+                      onClick: () => {
+                        activeKey.value = 'stock'
+                        setTimeout(() => {
+                          EventsEmit("changeTab", g)
+                        }, 100)
+                      },
+                    },
+                    {default: () => g.name,}
+                ),
+            key: g.ID,
+          }
+        }))
+      }
+    })
+  }).catch(err => {
+    console.error("refreshStockGroupMenu error:", err)
+  })
+}
 
 function renderIcon(icon) {
   return () => h(NIcon, null, {default: () => h(icon)})
@@ -981,6 +1455,14 @@ onBeforeUnmount(() => {
   EventsOff("loadingMsg")
   EventsOff("telegraph")
   EventsOff("newsPush")
+  EventsOff("dailyReviewGenerated")
+  EventsOff("morningStrategyGenerated")
+  EventsOff("groupListChanged")
+  EventsOff("updateDownloadStart")
+  EventsOff("downloadProgress")
+  EventsOff("updateDownloadComplete")
+  EventsOff("updateDownloadFailed")
+  EventsOff("updateApplied")
 })
 
 window.onerror = function (msg, source, lineno, colno, error) {
@@ -1002,58 +1484,31 @@ onBeforeMount(() => {
       content.value = result.officialStatement+"\n\n"+content.value
     }
     officialStatement.value = result.officialStatement || ""
+    isCustomBuild.value = result.customBuild === true
+    if (result.customBuild) {
+      // 定制版本编译（wails build -tags custom）：隐藏"关于"与"合约行情"菜单
+      menuOptions.value.forEach((item) => {
+        if (item.key === 'about' || item.key === 'contracts') {
+          item.show = false
+        }
+      })
+    }
     updateMarketStatus()
   }).catch(err => {
     console.error("GetVersionInfo error:", err)
   })
 
-  GetGroupList().then(result => {
-    groupList.value = result
-    menuOptions.value.map((item) => {
-      if (item.key === 'stock') {
-        item.children.push(...groupList.value.map(item => {
-          return {
-            label: () =>
-                h(
-                    'a',
-                    {
-                      href: '#',
-                      type: 'info',
-                      onClick: () => {
-                        router.push({
-                          name: 'stock',
-                          query: {
-                            groupName: item.name,
-                            groupId: item.ID,
-                          },
-                        })
-                        setTimeout(() => {
-                          EventsEmit("changeTab", item)
-                        }, 100)
-                      },
-                      to: {
-                        name: 'stock',
-                        query: {
-                          groupName: item.name,
-                          groupId: item.ID,
-                        },
-                      }
-                    },
-                    {default: () => item.name,}
-                ),
-            key: item.ID,
-          }
-        }))
-      }
-    })
-  }).catch(err => {
-    console.error("GetGroupList error:", err)
+  refreshStockGroupMenu()
+  // 监听分组变化（新增/改名/删除），实时刷新菜单栏
+  EventsOn("groupListChanged", () => {
+    refreshStockGroupMenu()
   })
 
 
   GetConfig().then((res) => {
     enableFund.value = res.enableFund
     enableAgent.value = res.enableAgent
+    enableContracts.value = res.enableContracts !== false
 
     menuOptions.value.filter((item) => {
       if (item.key === 'fund') {
@@ -1061,6 +1516,9 @@ onBeforeMount(() => {
       }
       if (item.key === 'agent') {
         item.show = res.enableAgent
+      }
+      if (item.key === 'contracts') {
+        item.show = !isCustomBuild.value && enableContracts.value
       }
     })
 
@@ -1087,7 +1545,8 @@ onMounted(() => {
     }
     enableFund.value = res.enableFund
     enableAgent.value = res.enableAgent
-    const {notification } =createDiscreteApi(["notification"], {
+    enableContracts.value = res.enableContracts !== false
+    const {notification, dialog } =createDiscreteApi(["notification","dialog"], {
       configProviderProps: {
         theme: enableDarkTheme.value ? darkTheme : lightTheme ,
         max: 3,
@@ -1123,6 +1582,141 @@ onMounted(() => {
         })
       }
     })
+
+    EventsOn("dailyReviewGenerated", (data) => {
+      if (!data) return
+      if (data.status === 'failed') {
+        notification.create({
+          title: `每日复盘生成失败（${data.date}）`,
+          content: () => h('div', {style: {"text-align": "left", "font-size": "14px", "color": "#f67979"}},
+              {default: () => data.errorMessage || '未知错误'}),
+          duration: 1000 * 30,
+        })
+      } else if (data.status === 'success') {
+        notification.create({
+          title: `每日复盘已生成（${data.date}）`,
+          content: () => h('div', {style: {"text-align": "left", "font-size": "14px"}},
+              {default: () => data.summary || ''}),
+          duration: 1000 * 30,
+        })
+      }
+    })
+
+    EventsOn("morningStrategyGenerated", (data) => {
+      if (!data) return
+      if (data.status === 'failed') {
+        notification.create({
+          title: `盘前策略生成失败（${data.date}）`,
+          content: () => h('div', {style: {"text-align": "left", "font-size": "14px", "color": "#f67979"}},
+              {default: () => data.errorMessage || '未知错误'}),
+          duration: 1000 * 30,
+        })
+      } else if (data.status === 'success') {
+        notification.create({
+          title: `盘前策略已生成（${data.date}）`,
+          content: () => h('div', {style: {"text-align": "left", "font-size": "14px"}},
+              {default: () => data.summary || ''}),
+          duration: 1000 * 30,
+        })
+      }
+    })
+
+    EventsOn("updateDownloadStart", (data) => {
+      downloadState.value = {
+        active: true, percentage: 0, speed: 0, avgSpeed: 0,
+        downloaded: 0, total: data.total || 0, version: data.version || '',
+        proxy: data.proxy || '(直连)', proxySpeed: data.proxySpeed || 0,
+        message: data.message || '', retrying: false,
+      }
+      if (downloadNotification) { downloadNotification.destroy(); downloadNotification = null }
+      downloadNotification = notification.create({
+        title: () => '正在下载新版本 ' + downloadState.value.version,
+        content: renderDownloadContent,
+        meta: () => h(NText, { type: 'warning' }, { default: () => 'go-stock' }),
+        duration: 0,
+      })
+    })
+
+    EventsOn("downloadProgress", (data) => {
+      if (data.status === 'retrying') {
+        downloadState.value.retrying = true
+        downloadState.value.percentage = 0
+        downloadState.value.downloaded = 0
+        downloadState.value.speed = 0
+        return
+      }
+      downloadState.value.retrying = false
+      downloadState.value.percentage = data.percentage || 0
+      downloadState.value.speed = data.speed || 0
+      downloadState.value.avgSpeed = data.avgSpeed || 0
+      downloadState.value.downloaded = data.downloaded || 0
+      downloadState.value.total = data.total || 0
+      if (data.proxy) {
+        downloadState.value.proxy = data.proxy
+      }
+    })
+
+    EventsOn("updateDownloadComplete", (data) => {
+      downloadState.value.active = false
+      downloadState.value.percentage = 100
+      if (downloadNotification) { downloadNotification.destroy(); downloadNotification = null }
+      notification.create({
+        title: '版本下载完成',
+        content: () => h('div', { style: { 'text-align': 'left', 'font-size': '14px', 'color': '#52c41a' } },
+          { default: () => '新版本 ' + data.version + ' 下载完成，正在安装更新...' }),
+        meta: () => h(NText, { type: 'warning' }, { default: () => 'go-stock' }),
+        duration: 5000,
+      })
+    })
+
+    // 更新安装就绪，弹出对话框让用户选择是否立即重启生效
+    EventsOn("updateApplied", (data) => {
+      dialog.warning({
+        title: '更新已就绪',
+        content: () => h('div', { style: { 'text-align': 'left', 'font-size': '14px' } },
+          { default: () => '新版本 ' + (data?.version || '') + ' 已安装完成，重启应用后即可生效。是否立即重启？' }),
+        positiveText: '立即重启',
+        negativeText: '稍后重启',
+        // 返回 promise 让按钮进入 loading 态：后端收尾（WAL checkpoint）期间用户可感知"正在重启"
+        onPositiveClick: () =>
+          RestartApp().catch(err => {
+            console.error('RestartApp error:', err)
+            notification.create({
+              title: '重启失败',
+              content: () => h('div', { style: { 'text-align': 'left', 'font-size': '14px', 'color': '#f67979' } },
+                { default: () => '重启应用失败：' + err }),
+              meta: () => h(NText, { type: 'warning' }, { default: () => 'go-stock' }),
+              duration: 10000,
+            })
+          }),
+      })
+    })
+
+    EventsOn("updateDownloadFailed", (data) => {
+      downloadState.value.active = false
+      if (downloadNotification) { downloadNotification.destroy(); downloadNotification = null }
+      const items = [
+        h('div', { style: { 'margin-bottom': '8px' } },
+          { default: () => '新版本 ' + data.version + ' 自动下载失败: ' + data.error })
+      ]
+      if (data.manualLinks) {
+        items.push(h('div', { style: { 'margin-bottom': '4px' } }, { default: () => '请手动下载后替换程序文件:' }))
+        items.push(h('div', {
+          style: { 'font-size': '12px', 'word-break': 'break-all', 'margin-bottom': '2px', 'color': '#549EC8' }
+        }, { default: () => '加速镜像: ' + data.manualLinks.mirror }))
+        items.push(h('div', {
+          style: { 'font-size': '12px', 'word-break': 'break-all', 'color': '#549EC8' }
+        }, { default: () => '原始地址: ' + data.manualLinks.original }))
+      }
+      notification.create({
+        title: '版本下载失败',
+        content: () => h('div', { style: { 'text-align': 'left', 'font-size': '14px', 'color': '#f67979' } },
+          { default: () => items }),
+        meta: () => h(NText, { type: 'warning' }, { default: () => 'go-stock' }),
+        duration: 0,
+      })
+    })
+
   }).catch(err => {
     console.error("GetConfig(onMounted) error:", err)
   })
@@ -1148,6 +1742,9 @@ onMounted(() => {
             >
 <!--              <FloatingAiAssistant />-->
               <FloatingAgentAssistant />
+              <!-- 信号监控面板在 custom 编译中保留（面板内部自行隐藏 OKX 双池页签与自动交易流水）；
+                   普通编译完整显示 -->
+              <SignalMonitorPanel />
               <n-flex>
                 <n-grid x-gap="12" :cols="1">
                   <n-gi>
@@ -1173,6 +1770,7 @@ onMounted(() => {
                               v-model:value="activeKey"
                               mode="horizontal"
                               :options="menuOptions"
+                              :dropdown-props="{ menuProps: () => ({ style: 'max-height: 60vh; overflow-y: auto;' }) }"
                               responsive
                       />
                     </n-card>
@@ -1187,5 +1785,46 @@ onMounted(() => {
   </n-config-provider>
 </template>
 <style>
-
+/* 菜单/下拉弹出层滚动条样式（naive-ui 弹出层渲染到 body，需全局作用域） */
+.n-dropdown-menu,
+.n-dropdown-menu .n-vm-list,
+.n-base-select-menu,
+.n-base-select-menu .n-vm-list {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(128, 128, 128, 0.45) transparent;
+}
+.n-dropdown-menu::-webkit-scrollbar,
+.n-dropdown-menu .n-vm-list::-webkit-scrollbar,
+.n-dropdown-menu .n-scrollbar-container::-webkit-scrollbar,
+.n-base-select-menu::-webkit-scrollbar,
+.n-base-select-menu .n-vm-list::-webkit-scrollbar,
+.n-base-select-menu .n-scrollbar-container::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.n-dropdown-menu::-webkit-scrollbar-thumb,
+.n-dropdown-menu .n-vm-list::-webkit-scrollbar-thumb,
+.n-dropdown-menu .n-scrollbar-container::-webkit-scrollbar-thumb,
+.n-base-select-menu::-webkit-scrollbar-thumb,
+.n-base-select-menu .n-vm-list::-webkit-scrollbar-thumb,
+.n-base-select-menu .n-scrollbar-container::-webkit-scrollbar-thumb {
+  background-color: rgba(128, 128, 128, 0.45);
+  border-radius: 3px;
+}
+.n-dropdown-menu::-webkit-scrollbar-thumb:hover,
+.n-dropdown-menu .n-vm-list::-webkit-scrollbar-thumb:hover,
+.n-dropdown-menu .n-scrollbar-container::-webkit-scrollbar-thumb:hover,
+.n-base-select-menu::-webkit-scrollbar-thumb:hover,
+.n-base-select-menu .n-vm-list::-webkit-scrollbar-thumb:hover,
+.n-base-select-menu .n-scrollbar-container::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(128, 128, 128, 0.7);
+}
+.n-dropdown-menu::-webkit-scrollbar-track,
+.n-dropdown-menu .n-vm-list::-webkit-scrollbar-track,
+.n-dropdown-menu .n-scrollbar-container::-webkit-scrollbar-track,
+.n-base-select-menu::-webkit-scrollbar-track,
+.n-base-select-menu .n-vm-list::-webkit-scrollbar-track,
+.n-base-select-menu .n-scrollbar-container::-webkit-scrollbar-track {
+  background: transparent;
+}
 </style>

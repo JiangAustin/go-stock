@@ -6,14 +6,20 @@ import (
 	"encoding/json"
 	"fmt"
 	assistantweb "go-stock/ai-assistant-web"
+	"go-stock/backend/apppath"
 	"go-stock/backend/data"
 	"go-stock/backend/db"
 	log "go-stock/backend/logger"
 	"go-stock/backend/machineid"
 	"go-stock/backend/models"
 	"os"
+	"os/signal"
+	"path/filepath"
+	goruntime "runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/duke-git/lancet/v2/convertor"
@@ -65,27 +71,51 @@ var OFFICIAL_STATEMENT string
 var BuildKey string
 
 func main() {
+	// 尽早把 Go 运行时致命错误（任意 goroutine 的 panic、并发 map 读写、栈溢出等）
+	// 的完整堆栈转储到 logs/crash.log，便于定位进程“静默消失”的根因。
+	setupCrashOutput()
+	// 记录退出信号（仅类 Unix；Windows GUI 程序不接收控制台信号）
+	installSignalLogger()
+
+	// 更新后「立即重启」场景：RestartApp 启动的新进程携带 -wait-parent=<旧进程PID>，
+	// 此处等待旧进程完全退出（释放 Wails 单实例锁）后再继续启动，
+	// 否则新进程会被 SingleInstanceLock 当作第二实例而直接退出，表现为"只关闭不重启"。
+	// 旧进程退出前会做 WAL checkpoint 收尾（最长 20s），等待上限须大于该收尾时长
+	if pid, ok := parentPIDFromArgs(); ok {
+		waitForProcessExit(pid, 60*time.Second)
+	}
+
 	defer func() {
 		if r := recover(); r != nil {
-			log.SugaredLogger.Error("panic: ", r)
-			log.SugaredLogger.Error("stack: ", string(debug.Stack()))
+			log.SugaredLogger.Errorf("main panic: %v\nstack: %s", r, string(debug.Stack()))
+			_ = log.SugaredLogger.Sync()
 		}
+		// wails.Run 返回即代表主流程结束：正常退出会走到这里；
+		// 若进程消失却没有这条日志，则说明是崩溃或被外部结束。
+		log.SugaredLogger.Infof("main 退出 pid=%d", os.Getpid())
+		_ = log.SugaredLogger.Sync()
 	}()
 
-	checkDir("data")
+	// 数据目录不再依赖进程工作目录：macOS 双击 .app 启动时 cwd 为只读的 "/"
+	checkDir(apppath.DataDir())
 	machineid.Init(BuildKey)
 	data.SponsorDecryptKeyHex = BuildKey
 	data.SetAppIcon(icon)
 	db.Init("")
 	data.InitAnalyzeSentiment()
 	go AutoMigrate()
+	// 每笔持仓止盈止损监控守护协程（幂等；未开启开关时空转，10 秒一次仅读配置）
+	// 定制版本（-tags custom）不含 OKX/合约功能，不启动该守护
+	if !CustomBuild {
+		data.StartOKXTPSLMonitor()
+	}
 
 	//db.Dao.Model(&data.Group{}).Where("id = ?", 0).FirstOrCreate(&data.Group{
 	//	Name: "默认分组",
 	//	Sort: 0,
 	//})
 
-	log.SugaredLogger.Info("starting...")
+	log.SugaredLogger.Infof("starting... pid=%d ppid=%d startTime=%s", os.Getpid(), os.Getppid(), time.Now().Format("2006-01-02 15:04:05"))
 	log.SugaredLogger.Infof("version: %s  commit: %s", Version, VersionCommit)
 	//log.SugaredLogger.Infof("build key: %s", BuildKey)
 
@@ -188,7 +218,7 @@ func main() {
 		BackgroundColour:         backgroundColour,
 		Assets:                   assets,
 		Menu:                     AppMenu,
-		Logger:                   logger.NewFileLogger("./logs/wails.log"),
+		Logger:                   logger.NewFileLogger(filepath.Join(apppath.LogsDir(), "wails.log")),
 		LogLevel:                 logger.DEBUG,
 		LogLevelProduction:       logger.INFO,
 		OnStartup:                app.startup,
@@ -237,6 +267,18 @@ func main() {
 
 }
 
+// parentPIDFromArgs 解析重启参数 -wait-parent=<pid>（由 RestartApp 在重启时注入）
+func parentPIDFromArgs() (int, bool) {
+	for _, arg := range os.Args[1:] {
+		if pidStr, found := strings.CutPrefix(arg, "-wait-parent="); found {
+			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 {
+				return pid, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func cacheCookies(url string) {
 	log.SugaredLogger.Info("预缓存东财 Cookie...")
 	_, err := data.FetchEastMoneyCookiesViaChromedp("", 3*time.Minute, url)
@@ -282,6 +324,8 @@ func AutoMigrate() {
 	db.Dao.AutoMigrate(&models.PromptTemplate{})
 	db.Dao.AutoMigrate(&data.Group{})
 	db.Dao.AutoMigrate(&data.GroupStock{})
+	db.Dao.AutoMigrate(&data.Concept{})
+	db.Dao.AutoMigrate(&data.ConceptStock{})
 	db.Dao.AutoMigrate(&models.Tags{})
 	db.Dao.AutoMigrate(&models.Telegraph{})
 	db.Dao.AutoMigrate(&models.TelegraphTags{})
@@ -300,6 +344,14 @@ func AutoMigrate() {
 	db.Dao.AutoMigrate(&models.MCPServerTool{})
 	db.Dao.AutoMigrate(&models.Skill{})
 	db.Dao.AutoMigrate(&models.CustomStrategy{})
+	db.Dao.AutoMigrate(&models.BKFundFlow{})
+	db.Dao.AutoMigrate(&models.ConceptFundFlow{})
+	db.Dao.AutoMigrate(&models.DailyOperationPlan{})
+	db.Dao.AutoMigrate(&models.DailyReview{})
+	db.Dao.AutoMigrate(&models.MorningStrategy{})
+	db.Dao.AutoMigrate(&models.PromptBacktestTask{})
+	db.Dao.AutoMigrate(&models.PromptBacktestPick{})
+	db.Dao.AutoMigrate(&models.SignalRecord{})
 
 	//updateMultipleModel()
 
@@ -466,14 +518,57 @@ func initStockData(ctx context.Context) {
 }
 
 func checkDir(dir string) {
-	_, err := os.Stat(dir)
-	if os.IsNotExist(err) {
-		os.Mkdir(dir, os.ModePerm)
-		log.SugaredLogger.Info("create dir: " + dir)
+	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		log.SugaredLogger.Errorf("create dir %s failed: %v", dir, err)
 	}
 	if BuildKey == "" {
-		BuildKey = "cc1e0d684e32f176c56ff1fcf384dcd9"
+		// 正式密钥只经 ldflags（-X main.BuildKey=...）注入，不落仓库；缺失时只能用占位密钥，
+		// 此时赞助码必然校验失败（历史上表现为"Windows 能验证、mac 不能"，因为 mac 走 CI）。
+		// 这里显式告警，避免发布出一个赞助码不可用的包。
+		BuildKey = data.DefaultSponsorAESKeyHex
+		log.SugaredLogger.Warnf("BuildKey 未注入，已回退到占位密钥，赞助码校验将失败；" +
+			"正式发布请使用 -ldflags \"-X main.BuildKey=...\" 构建")
 	}
+}
+
+// crashOutputFile 持有崩溃转储文件句柄，避免被 GC 回收后关闭（运行时不会重新打开它）。
+var crashOutputFile *os.File
+
+// setupCrashOutput 把 Go 运行时致命错误的完整堆栈转储写入 logs/crash.log。
+// 覆盖场景：任意 goroutine 中未捕获的 panic、并发 map 读写、栈溢出、fatal error 等。
+// 这类错误默认只写 stderr，GUI 程序无控制台时表现为“进程静默消失”。
+func setupCrashOutput() {
+	dir := apppath.LogsDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "crash.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	crashOutputFile = f
+	_ = debug.SetCrashOutput(f, debug.CrashOptions{})
+}
+
+// installSignalLogger 在收到退出信号时记录一条日志，便于区分“信号终止”与“崩溃”。
+// 仅类 Unix 生效：Windows GUI 程序不接收控制台信号，重发信号的语义也不一致。
+func installSignalLogger() {
+	if goruntime.GOOS == "windows" {
+		return
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-ch
+		log.SugaredLogger.Errorf("收到退出信号 %v，进程即将退出 pid=%d", sig, os.Getpid())
+		_ = log.SugaredLogger.Sync()
+		// 恢复默认处理并重新触发，保留原有退出行为
+		signal.Stop(ch)
+		if p, err := os.FindProcess(os.Getpid()); err == nil {
+			_ = p.Signal(sig)
+		}
+		os.Exit(0)
+	}()
 }
 
 // PanicHandler 捕获 panic 的包装函数

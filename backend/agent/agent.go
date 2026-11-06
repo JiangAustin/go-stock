@@ -2,20 +2,30 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go-stock/backend/agent/tools"
+	"go-stock/backend/apppath"
 	"go-stock/backend/data"
 	"go-stock/backend/db"
 	"go-stock/backend/logger"
 	"go-stock/backend/models"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/bytedance/sonic"
-	einomcp "github.com/cloudwego/eino-ext/components/tool/mcp"
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/adk/middlewares/dynamictool/toolsearch"
+	"github.com/cloudwego/eino/adk/middlewares/skill"
+	"github.com/cloudwego/eino/adk/middlewares/summarization"
+	"github.com/cloudwego/eino/adk/prebuilt/deep"
 	"github.com/cloudwego/eino/adk/prebuilt/planexecute"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
@@ -24,108 +34,147 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
-type AgentMode string
+type Mode string
 
 const (
-	AgentModeReact       AgentMode = "react"
-	AgentModePlanExecute AgentMode = "plan_execute"
+	React       Mode = "react"
+	PlanExecute Mode = "plan_execute"
+	DeepAgents  Mode = "deepagents"
 )
 
-type AgentInstance struct {
-	Mode       AgentMode
+// summaryGenerateTimeout 摘要生成调用的独立超时。
+// 摘要中间件触发时会在 ChatModel 节点内发起一次嵌套模型调用，若沿用主请求
+// 临近到期的 deadline 会触发 "context deadline exceeded"。此处为摘要生成
+// 单独留出充足的超时预算，且不受主请求 deadline 影响。
+const summaryGenerateTimeout = 5 * time.Minute
+
+type Instance struct {
+	Mode       Mode
 	ReactAgent *react.Agent
 	AdkAgent   adk.ResumableAgent
+	// ChatModel 主对话模型，用于工具结果摘要等场景（由 GetStockAiAgent 在创建时填充）。
+	ChatModel model.ToolCallingChatModel
+	// Tools 该实例实际注入给模型的工具列表，用于工具 schema token 预算估算。
+	// 工具 schema 会被 eino 注入到每次模型请求，若不扣除会导致上下文超限。
+	Tools []tool.BaseTool
 }
 
-func classifyComplexity(question string) AgentMode {
-	lowerQ := strings.ToLower(question)
-
-	simplePatterns := []string{
-		"今天", "当前", "最新", "现在", "实时",
-		"查询", "查一下", "帮我查", "告诉我",
-		"什么是", "是什么", "多少", "几号",
-		"是否", "有没有", "能不能",
-		"开盘价", "收盘价", "最高价", "最低价",
-		"停牌", "复牌", "上市",
-		"代码", "名称", "简称",
-	}
-
-	for _, p := range simplePatterns {
-		if strings.Contains(lowerQ, p) {
-			wordCount := len([]rune(question))
-			if wordCount < 30 {
-				return AgentModeReact
-			}
-		}
-	}
-
-	complexPatterns := []string{
-		"全面分析", "综合分析", "深度分析", "详细分析",
-		"多维度", "全方位", "系统分析",
-		"投资建议", "操作建议", "买卖建议",
-		"对比分析", "比较分析", "横向对比",
-		"行业分析", "赛道分析", "产业链",
-		"投资组合", "资产配置", "仓位",
-		"风险评估", "风险分析",
-		"研究报告", "投资报告",
-		"宏观", "政策", "周期",
-	}
-
-	for _, p := range complexPatterns {
-		if strings.Contains(lowerQ, p) {
-			return AgentModePlanExecute
-		}
-	}
-
-	toolGroupCount := 0
-	groups := tools.ClassifyQuestion(question)
-	for range groups {
-		toolGroupCount++
-	}
-	if toolGroupCount >= 4 {
-		return AgentModePlanExecute
-	}
-
+func classifyComplexity(question string) Mode {
+	intent := tools.DetectQuestionIntent(question)
 	wordCount := len([]rune(question))
-	if wordCount > 80 {
-		return AgentModePlanExecute
-	}
 
-	return AgentModeReact
+	switch intent {
+	case tools.IntentComprehensiveReport:
+		return PlanExecute
+	case tools.IntentQuoteLookup, tools.IntentCodeLookup:
+		if wordCount > 80 {
+			return PlanExecute
+		}
+		return React
+	case tools.IntentScreening:
+		if wordCount > 50 || containsMultiSubject(question) {
+			return PlanExecute
+		}
+		return React
+	case tools.IntentMarketOverview, tools.IntentNewsResearch, tools.IntentMoneyFlow:
+		if wordCount > 80 || containsMultiSubject(question) {
+			return PlanExecute
+		}
+		return React
+	default:
+		// 用「显式命中的分组数」而非 ClassifyQuestion 的结果：后者含常驻核心组，
+		// 会让任何问题都被算成横跨多领域而升级为 PlanExecute。
+		groups := tools.MatchedToolGroups(question)
+		if len(groups) >= 5 {
+			return PlanExecute
+		}
+		if wordCount > 80 {
+			return PlanExecute
+		}
+		return React
+	}
 }
 
-func GetStockAiAgent(ctx *context.Context, aiConfig data.AIConfig, question string, agentMode string) *AgentInstance {
-	logger.SugaredLogger.Infof("GetStockAiAgent aiConfig: %v", aiConfig)
+func containsMultiSubject(question string) bool {
+	markers := []string{"以及", "并且", "同时", "分别", "对比", "比较", "多个", "哪些", "组合"}
+	lowerQ := strings.ToLower(question)
+	count := 0
+	for _, m := range markers {
+		if strings.Contains(lowerQ, m) {
+			count++
+		}
+	}
+	return count >= 1 && len([]rune(question)) > 40
+}
+
+// GetStockAiAgent 创建 Agent 实例。
+//
+// sysPromptHint 为系统提示词中由「用户/技能/模板配置」决定的文本（见 mcpPromptHint），
+// 仅用于 MCP 工具注入判定——Agent 与工具清单在此处就要定下来，早于 ChatWithContext
+// 里 sysPrompt 的完整组装（含依赖 instance.Mode 的运行时片段）。
+func GetStockAiAgent(ctx *context.Context, aiConfig data.AIConfig, question string, agentMode string, sysPromptHint string) (*Instance, error) {
+	// AIConfig 包含 ApiKey，禁止直接用 %v 打印整个配置，避免凭据进入日志。
+	logger.SugaredLogger.Infof("GetStockAiAgent: config_id=%d name=%q model=%q base_url=%q mode=%q",
+		aiConfig.ID, aiConfig.Name, aiConfig.ModelName, aiConfig.BaseUrl, agentMode)
 	toolableChatModel, err := createChatModel(*ctx, aiConfig)
 	if err != nil {
-		logger.SugaredLogger.Error(err.Error())
-		return nil
+		return nil, fmt.Errorf("创建聊天模型失败: %w", err)
 	}
 
 	//allTools := getAllTools()
-	allTools := getToolsByQuestion(question)
 
-	var mode AgentMode
-	switch AgentMode(agentMode) {
-	case AgentModeReact:
-		mode = AgentModeReact
-	case AgentModePlanExecute:
-		mode = AgentModePlanExecute
+	var mode Mode
+	switch Mode(agentMode) {
+	case React:
+		mode = React
+	case PlanExecute:
+		mode = PlanExecute
+	case DeepAgents:
+		mode = DeepAgents
 	default:
 		mode = classifyComplexity(question)
 	}
 
+	// DeepAgents 通过 ToolSearch 动态检索 MCP 工具，恒保留 MCP；React/PlanExecute
+	// 按问题/技能声明/系统提示词是否点名 MCP 服务器或工具决定注入谁，避免 MCP 工具
+	// schema 每轮固定占用 token。DeepAgents 恒注入全部，无需为此再查一次技能声明。
+	mcpCtx := mcpInjectContext{}
+	if mode != DeepAgents {
+		mcpCtx = mcpInjectContextFor(question, sysPromptHint)
+	}
+	allTools := getToolsByQuestion(question, mcpCtx, mode == DeepAgents)
+
 	logger.SugaredLogger.Infof("Agent mode selected: %s (user=%q), question=%q, tools=%d", mode, agentMode, question, len(allTools))
 
 	switch mode {
-	case AgentModePlanExecute:
-		return createPlanExecuteAgent(*ctx, toolableChatModel, allTools, aiConfig)
+	case PlanExecute:
+		inst, err := createPlanExecuteAgent(*ctx, toolableChatModel, allTools, aiConfig)
+		if err != nil {
+			return nil, err
+		}
+		inst.ChatModel = toolableChatModel
+		inst.Tools = allTools
+		return inst, nil
+	case DeepAgents:
+		inst, err := createDeepAgent(*ctx, toolableChatModel, allTools, aiConfig)
+		if err != nil {
+			return nil, err
+		}
+		inst.ChatModel = toolableChatModel
+		inst.Tools = allTools
+		return inst, nil
 	default:
-		return createReactAgent(*ctx, toolableChatModel, allTools, aiConfig)
+		inst, err := createReactAgent(*ctx, toolableChatModel, allTools, aiConfig)
+		if err != nil {
+			return nil, err
+		}
+		inst.ChatModel = toolableChatModel
+		inst.Tools = allTools
+		return inst, nil
 	}
 }
 
-func createReactAgent(ctx context.Context, chatModel model.ToolCallingChatModel, allTools []tool.BaseTool, aiConfig data.AIConfig) *AgentInstance {
+func createReactAgent(ctx context.Context, chatModel model.ToolCallingChatModel, allTools []tool.BaseTool, aiConfig data.AIConfig) (*Instance, error) {
 	aiTools := compose.ToolsNodeConfig{
 		Tools:               allTools,
 		ToolCallMiddlewares: []compose.ToolMiddleware{errorRecoveryMiddleware()},
@@ -143,44 +192,84 @@ func createReactAgent(ctx context.Context, chatModel model.ToolCallingChatModel,
 		ToolsConfig:      aiTools,
 		MaxStep:          maxStep,
 		MessageRewriter: func(ctx context.Context, input []*schema.Message) []*schema.Message {
-			maxTokens := getMaxInputTokens(aiConfig.MaxTokens)
+			// 解析上下文窗口与输出上限，扣减输出预留后计算输入预算
+			cw := resolveContextWindow(aiConfig)
+			out := resolveOutputMaxTokens(aiConfig, cw)
+			maxTokens := getMaxInputTokens(cw, out)
+			// 工具 schema 由 eino 注入到每次模型请求，需从压缩预算中扣除，
+			// 避免 React 长工具链累积后上下文超限。
+			if toolTokens := estimateToolsTokens(allTools); toolTokens > 0 {
+				maxTokens -= toolTokens
+				if maxTokens < 4000 {
+					maxTokens = 4000
+				}
+			}
 			return compressMessages(input, maxTokens)
 		},
 		StreamToolCallChecker: func(ctx context.Context, modelOutput *schema.StreamReader[*schema.Message]) (bool, error) {
+			// eino 合约：handler 返回前必须关闭 modelOutput stream（见 react.go L175 注释）。
+			// 不关闭会导致 parentStreamReader 的 closedNum 永远不达阈值，底层 sr.Close() 不被触发，造成资源泄漏。
+			defer modelOutput.Close()
 			hasToolCall := false
+			totalChunks := 0
+			contentChunks := 0
+			reasoningChunks := 0
+			toolCallChunks := 0
+			var lastFinishReason string
 			for {
 				msg, err := modelOutput.Recv()
 				if err != nil {
-					break
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					logger.SugaredLogger.Errorf("StreamToolCallChecker recv error: %v", err)
+					return hasToolCall, err
+				}
+				if msg == nil {
+					continue
+				}
+				totalChunks++
+				if msg.Content != "" {
+					contentChunks++
+				}
+				if msg.ReasoningContent != "" {
+					reasoningChunks++
 				}
 				if len(msg.ToolCalls) > 0 {
 					hasToolCall = true
+					toolCallChunks++
+				}
+				if msg.ResponseMeta != nil && msg.ResponseMeta.FinishReason != "" {
+					lastFinishReason = msg.ResponseMeta.FinishReason
 				}
 			}
+			logger.SugaredLogger.Infof("StreamToolCallChecker: total=%d content=%d reasoning=%d tool_calls=%d has_tool_call=%v finish_reason=%s",
+				totalChunks, contentChunks, reasoningChunks, toolCallChunks, hasToolCall, lastFinishReason)
 			return hasToolCall, nil
 		},
 	})
 	if err != nil {
-		logger.SugaredLogger.Errorf("创建React Agent失败: %v", err)
-		return nil
+		return nil, fmt.Errorf("创建 React Agent 失败: %w", err)
 	}
 
-	return &AgentInstance{
-		Mode:       AgentModeReact,
+	return &Instance{
+		Mode:       React,
 		ReactAgent: agent,
-	}
+	}, nil
 }
 
-func createPlanExecuteAgent(ctx context.Context, chatModel model.ToolCallingChatModel, allTools []tool.BaseTool, aiConfig data.AIConfig) *AgentInstance {
+func createPlanExecuteAgent(ctx context.Context, chatModel model.ToolCallingChatModel, allTools []tool.BaseTool, aiConfig data.AIConfig) (*Instance, error) {
 	planner, err := planexecute.NewPlanner(ctx, &planexecute.PlannerConfig{
 		ToolCallingChatModel: chatModel,
 		GenInputFn:           genPlannerInput,
 	})
 	if err != nil {
-		logger.SugaredLogger.Errorf("创建Planner失败: %v", err)
-		return nil
+		return nil, fmt.Errorf("创建 Planner 失败: %w", err)
 	}
-
+	maxStep := len(allTools)*2 + 10
+	if maxStep < 30 {
+		maxStep = 30
+	}
 	executor, err := planexecute.NewExecutor(ctx, &planexecute.ExecutorConfig{
 		Model: chatModel,
 		ToolsConfig: adk.ToolsConfig{
@@ -192,12 +281,11 @@ func createPlanExecuteAgent(ctx context.Context, chatModel model.ToolCallingChat
 				},
 			},
 		},
-		MaxIterations: 40,
+		MaxIterations: maxStep,
 		GenInputFn:    genExecutorInput,
 	})
 	if err != nil {
-		logger.SugaredLogger.Errorf("创建Executor失败: %v", err)
-		return nil
+		return nil, fmt.Errorf("创建 Executor 失败: %w", err)
 	}
 
 	replanner, err := planexecute.NewReplanner(ctx, &planexecute.ReplannerConfig{
@@ -205,8 +293,7 @@ func createPlanExecuteAgent(ctx context.Context, chatModel model.ToolCallingChat
 		GenInputFn: genReplannerInput,
 	})
 	if err != nil {
-		logger.SugaredLogger.Errorf("创建Replanner失败: %v", err)
-		return nil
+		return nil, fmt.Errorf("创建 Replanner 失败: %w", err)
 	}
 
 	peAgent, err := planexecute.New(ctx, &planexecute.Config{
@@ -216,64 +303,497 @@ func createPlanExecuteAgent(ctx context.Context, chatModel model.ToolCallingChat
 		MaxIterations: 7,
 	})
 	if err != nil {
-		logger.SugaredLogger.Errorf("创建PlanExecute Agent失败: %v", err)
-		return nil
+		return nil, fmt.Errorf("创建 PlanExecute Agent 失败: %w", err)
 	}
 
-	return &AgentInstance{
-		Mode:     AgentModePlanExecute,
+	return &Instance{
+		Mode:     PlanExecute,
 		AdkAgent: peAgent,
+	}, nil
+}
+
+// splitStaticAndDynamicTools 将工具列表划分为：
+//   - staticTools：内置工具（查询/行情/记忆/知识库/画像等），始终对模型可见；
+//   - dynamicTools：外部 MCP 工具（经 MarkMCPTools 标记），放入 ToolSearch 动态检索，按需加载。
+//
+// 内置工具全部常驻：经实测，把非核心内置工具下沉 ToolSearch 会导致
+// （1）多轮 tool_search 往返；（2）工具列表逐轮变化打穿 KV-cache，大 system prompt
+// 反复重新 prefill，延迟成倍放大；（3）模型看不到被隐藏工具的签名，搜不到即报
+// "工具不存在"，回答不完整。MCP 工具数量有限且可选，保留动态检索收益。
+func splitStaticAndDynamicTools(allTools []tool.BaseTool) (staticTools, dynamicTools []tool.BaseTool) {
+	for _, t := range allTools {
+		if t == nil {
+			staticTools = append(staticTools, t)
+			continue
+		}
+		if tools.IsDynamicTool(t) {
+			dynamicTools = append(dynamicTools, t)
+			continue
+		}
+		staticTools = append(staticTools, t)
 	}
+	return staticTools, dynamicTools
+}
+
+// createDeepAgent 创建 DeepAgents 模式 Agent。
+// DeepAgents 基于 eino ADK prebuilt/deep，内置任务规划（write_todos）、子 Agent 委派（task）
+// 和通用子代理能力，适合复杂多步分析任务。
+//
+// 设计决策：
+//   - Instruction 留空使用内置默认 prompt（含 write_todos/task 使用指引），股票领域知识
+//     通过 messages[0] 系统消息注入，模型同时获得工具使用指引和领域专业知识。
+//   - 始终启用文件系统 Backend（ls/read_file/write_file/edit_file/glob/grep）、StreamingShell
+//     （execute）与 skill 中间件（渐进式展示），保证 DeepAgents 具备完整文件/工程能力。
+//   - 保留 write_todos（任务规划）和 general-purpose 子代理（上下文隔离委派）。
+//   - 自定义股票工具与内置工具自动合并，无需排除内置工具名。
+func createDeepAgent(ctx context.Context, chatModel model.ToolCallingChatModel, allTools []tool.BaseTool, aiConfig data.AIConfig) (*Instance, error) {
+	// 文件系统沙箱根：可执行文件所在目录，桌面应用启动时即为 go-stock 根目录
+	rootDir := deepAgentRootDir()
+	fsBackend := tools.NewLocalFilesystemBackend(rootDir)
+	streamingShell := tools.NewLocalStreamingShell(rootDir, 60*time.Second)
+	// GO_STOCK_SHELL_READONLY=1/true 开启只读模式：禁止重定向写入与变更命令，
+	// 适合仅需代码/数据分析的纯查询场景；构建、测试等需写文件的场景不要开启。
+	if v := strings.TrimSpace(os.Getenv("GO_STOCK_SHELL_READONLY")); v == "1" || strings.EqualFold(v, "true") {
+		streamingShell = streamingShell.WithReadOnly()
+		logger.SugaredLogger.Infof("DeepAgents Shell 只读模式已启用（GO_STOCK_SHELL_READONLY=%s）", v)
+	}
+
+	logger.SugaredLogger.Infof("DeepAgents 启用文件系统与 Shell: fs_root=%s, %s",
+		fsBackend.RootDir(), streamingShell.ShellInfo())
+
+	var handlers []adk.TypedChatModelAgentMiddleware[*schema.Message]
+	// 构建 skill 中间件：组合文件系统技能（SKILL.md）与数据库技能（models.Skill）
+	if skillHandler := buildSkillMiddleware(ctx, fsBackend, rootDir); skillHandler != nil {
+		handlers = append(handlers, skillHandler)
+		logger.SugaredLogger.Infof("DeepAgents 启用 skill 中间件（渐进式展示）")
+	}
+
+	// 仅外部 MCP 工具划分到 ToolSearch 动态检索，内置工具全部常驻可见。
+	staticTools, dynamicTools := splitStaticAndDynamicTools(allTools)
+	if len(dynamicTools) > 0 {
+		tsHandler, tsErr := toolsearch.New(ctx, &toolsearch.Config{
+			DynamicTools: dynamicTools,
+		})
+		if tsErr != nil {
+			// 降级：动态检索中间件不可用时把工具放回常驻列表，
+			// 否则它们既不在 staticTools 也不在任何 handler 中，会凭空消失。
+			logger.SugaredLogger.Warnf("创建 ToolSearch 中间件失败，非核心工具降级为常驻工具: %v", tsErr)
+			staticTools = append(staticTools, dynamicTools...)
+		} else {
+			handlers = append(handlers, tsHandler)
+			logger.SugaredLogger.Infof("DeepAgents 启用 ToolSearch 动态工具检索: 常驻=%d, 动态=%d（MCP）",
+				len(staticTools), len(dynamicTools))
+		}
+	} else {
+		staticTools = allTools
+	}
+
+	// summarization 中间件：对话 token 超阈值时自动摘要历史，避免上下文溢出
+	if summarizationHandler := buildSummarizationMiddleware(ctx, chatModel, rootDir, aiConfig); summarizationHandler != nil {
+		handlers = append(handlers, summarizationHandler)
+		logger.SugaredLogger.Infof("DeepAgents 启用 summarization 中间件（自动摘要）")
+	}
+	maxStep := len(allTools)*2 + 10
+	if maxStep < 30 {
+		maxStep = 30
+	}
+	deepAgent, err := deep.New(ctx, &deep.Config{
+		Name:        "StockDeepAgent",
+		Description: "具备任务规划、子Agent委派能力的股票投资分析深度Agent",
+		ChatModel:   chatModel,
+		// Instruction 留空：使用内置默认 prompt（含 write_todos/task 使用指引）。
+		// 股票领域专家提示词通过 messages[0] 系统消息注入，typedGenModelInput 会将
+		// 内置 Instruction 作为第一个系统消息、传入 messages（含股票系统消息）紧随其后。
+		Instruction: "",
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				// 内置工具常驻；外部 MCP 工具由 ToolSearch 中间件动态注入
+				Tools:               staticTools,
+				ToolCallMiddlewares: []compose.ToolMiddleware{errorRecoveryMiddleware()},
+				UnknownToolsHandler: func(ctx context.Context, name string, input string) (string, error) {
+					return fmt.Sprintf("工具 '%s' 不存在，请使用可用的工具列表中的工具。", name), nil
+				},
+			},
+		},
+		MaxIteration: maxStep,
+		// 始终挂载文件系统与 Shell，DeepAgents 具备完整文件/工程能力。
+		Backend:        fsBackend,
+		StreamingShell: streamingShell,
+		Handlers:       handlers,
+		// 保留 write_todos（任务规划）和 general-purpose 子代理（上下文隔离委派）。
+	})
+	if err != nil {
+		return nil, fmt.Errorf("创建 DeepAgents Agent 失败: %w", err)
+	}
+
+	return &Instance{
+		Mode:     DeepAgents,
+		AdkAgent: deepAgent,
+	}, nil
+}
+
+// buildSkillMiddleware 构建 skill 中间件，基于文件系统技能。
+//
+// 文件系统技能：扫描 rootDir/skills/ 下的一级子目录中的 SKILL.md 文件，
+// 支持脚本（scripts/）、参考文档（references/）等资源，适合复杂多步技能。
+//
+// 若 skills 目录不存在或无技能，返回 nil（不注册中间件）。
+func buildSkillMiddleware(ctx context.Context, fsBackend *tools.LocalFilesystemBackend, rootDir string) adk.ChatModelAgentMiddleware {
+	skillsDir := filepath.Join(rootDir, "skills")
+
+	// 使用容错后端：单个 SKILL.md 的 frontmatter 解析失败时仅跳过该技能并记日志，
+	// 不会让整个 skill 列表加载失败、进而崩溃 DeepAgents Agent。
+	// （eino 内置的 filesystemBackend 遇到任意一个坏技能会让 List/Get 返回错误，
+	//  经 Info() 传播到 NewToolNode 导致整个 Agent 工具列表构建失败。）
+	fileBackend := newTolerantSkillBackend(fsBackend, skillsDir)
+
+	// 检查是否有可用技能（格式错误的技能已被跳过，详见 tolerantSkillBackend.List）
+	matters, err := fileBackend.List(ctx)
+	if err != nil {
+		logger.SugaredLogger.Warnf("列出技能失败: %v", err)
+		return nil
+	}
+	if len(matters) == 0 {
+		// skills 目录不存在或无可用技能，不注册中间件
+		return nil
+	}
+	logger.SugaredLogger.Infof("skill 中间件: 发现 %d 个文件系统技能", len(matters))
+
+	handler, err := skill.NewMiddleware(ctx, &skill.Config{
+		Backend: fileBackend,
+	})
+	if err != nil {
+		logger.SugaredLogger.Warnf("创建 skill 中间件失败: %v", err)
+		return nil
+	}
+	return handler
+}
+
+// summaryContentEnsurer 包装 chatModel，确保 Generate 返回的 assistant 消息
+// 始终带有非空 Content。
+//
+// 背景：eino summarization 中间件通过 getAssistantTextContent 读取响应的
+// Content 字段作为摘要文本，不读取 ReasoningContent。当主 chatModel 是
+// 思考/推理模型（DeepSeek-R1、Qwen3-thinking、Claude extended thinking、
+// Ark Thinking、Ollama thinking 等）时，模型可能将整个摘要输出放入
+// ReasoningContent 而留空 Content，导致中间件抛出
+// "summary content is empty" 错误并中断 Agent。
+//
+// 本包装器在 Generate 返回时检测 Content 为空但 ReasoningContent 非空的
+// assistant 消息，将 ReasoningContent 复制到 Content，使下游能正常提取摘要。
+// Stream 透传不动，因 summarization 中间件仅调用 Generate。
+//
+// 仅用于 summarization 中间件，不影响主 Agent 行为。
+type summaryContentEnsurer struct {
+	model.BaseModel[*schema.Message]
+}
+
+func (w *summaryContentEnsurer) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+	// 摘要生成使用独立的宽松超时：通过 context.WithoutCancel 断开与主请求
+	// 接近到期的 deadline 的耦合（同时保留 trace 等上下文值），再叠加独立超时。
+	// 否则嵌套的摘要模型调用会继承主请求已临近到期的 deadline，
+	// 触发 "context deadline exceeded" 并中断整个 Agent 运行。
+	summaryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), summaryGenerateTimeout)
+	defer cancel()
+
+	resp, err := w.BaseModel.Generate(summaryCtx, input, opts...)
+	if err != nil {
+		return resp, err
+	}
+	if resp != nil && resp.Role == schema.Assistant && resp.Content == "" && resp.ReasoningContent != "" {
+		logger.SugaredLogger.Infof("summarization: 模型返回空 Content，回退使用 ReasoningContent (%d 字)", len([]rune(resp.ReasoningContent)))
+		resp.Content = resp.ReasoningContent
+	}
+	return resp, nil
+}
+
+// buildSummarizationMiddleware 构建摘要中间件。
+//
+// 当对话历史 token 数超过阈值时，自动调用模型生成摘要，用摘要替换旧消息，
+// 避免 DeepAgent 多轮迭代后上下文窗口溢出。实现对齐 eino 官方文档：
+// https://www.cloudwego.io/zh/docs/eino/core_modules/eino_adk/eino_adk_chatmodelagentmiddleware/middleware_summarization/
+//
+// 触发条件（任一满足即触发）：
+//   - ContextTokens > tokenThreshold：按模型上下文窗口自适应。阈值取
+//     (contextWindow - outputMaxTokens) × 80%，先扣减输出预留（API 强制
+//     input + max_tokens ≤ context_window），确保在请求真正超过模型上下文
+//     之前就触发摘要（官方文档建议 80-90%）。上下文窗口由 resolveContextWindow
+//     解析（ContextWindow 字段 > 内置表 > MaxTokens 兜底 > 默认 64000）。
+//   - ContextMessages > 60：消息数兜底，防超长工具调用未达 token 阈值但消息过多。
+//
+// TokenCounter 使用本项目自带的 estimateTokens（区分中英文字符系数），比 eino 默认
+// 估算（增量消息按 ~4 字符/token）对中文更准确，避免低估 token 数导致触发过晚。
+// 摘要生成复用主 chatModel 并配置重试；原始对话转存到 logs/agent_transcript.md 供回溯。
+// 模型经 summaryContentEnsurer 包装，兼容思考模型将输出写入 ReasoningContent 的情况。
+func buildSummarizationMiddleware(ctx context.Context, chatModel model.BaseModel[*schema.Message], rootDir string, aiConfig data.AIConfig) adk.ChatModelAgentMiddleware {
+	// 确保日志目录存在，供 TranscriptFilePath 使用
+	logDir := filepath.Join(rootDir, "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		logger.SugaredLogger.Warnf("summarization: 创建日志目录失败: %v", err)
+	}
+
+	// 自适应摘要阈值：先解析上下文窗口与输出上限，再扣减输出预留。
+	// API 强制约束 input + max_tokens ≤ context_window，故可用输入 =
+	// contextWindow - outputMaxTokens，阈值取其 80% 在溢出前触发并留足余量。
+	contextWindow := resolveContextWindow(aiConfig)
+	outputMaxTokens := resolveOutputMaxTokens(aiConfig, contextWindow)
+	availableInput := contextWindow - outputMaxTokens
+	if availableInput < 4000 {
+		availableInput = 4000
+	}
+	tokenThreshold := int(float64(availableInput) * 0.8)
+	if tokenThreshold < 8000 {
+		tokenThreshold = 8000
+	}
+	logger.SugaredLogger.Infof("summarization 中间件: 上下文窗口=%d, 输出上限=%d, 可用输入=%d, token阈值=%d",
+		contextWindow, outputMaxTokens, availableInput, tokenThreshold)
+
+	transcriptPath := filepath.Join(logDir, "agent_transcript.md")
+
+	retryMax := 2
+	handler, err := summarization.New(ctx, &summarization.Config{
+		Model: &summaryContentEnsurer{BaseModel: chatModel},
+		// 自定义 token 计数：用项目自带估算（中文准确），覆盖 eino 默认的 ~4 字符/token。
+		TokenCounter: func(ctx context.Context, input *summarization.TokenCounterInput) (int, error) {
+			return estimateMessagesTokens(input.Messages) + estimateToolInfosTokens(input.Tools), nil
+		},
+		Trigger: &summarization.TriggerCondition{
+			ContextTokens:   tokenThreshold,
+			ContextMessages: 60,
+		},
+		TranscriptFilePath: transcriptPath,
+		// 摘要生成重试：失败时重试，提高长对话压缩的可靠性
+		Retry: &summarization.RetryConfig{
+			MaxRetries: &retryMax,
+		},
+	})
+	if err != nil {
+		logger.SugaredLogger.Warnf("创建 summarization 中间件失败: %v", err)
+		return nil
+	}
+	return &nonFatalSummaryMiddleware{inner: handler}
+}
+
+// nonFatalSummaryMiddleware 包装 summarization 中间件，使摘要生成失败时不中断
+// 整个 Agent 运行。摘要属于旁路优化（压缩历史避免上下文溢出），失败时应降级
+// 跳过（保留原始未压缩消息），而非杀死 Agent。
+//
+// 常见失败场景：本地 Ollama 模型 BaseURL 配置错误返回 404、模型超时、模型服务
+// 暂时不可用等。这些错误不应导致用户无法使用 Agent。
+type nonFatalSummaryMiddleware struct {
+	*adk.BaseChatModelAgentMiddleware
+	inner adk.ChatModelAgentMiddleware
+}
+
+func (w *nonFatalSummaryMiddleware) BeforeModelRewriteState(
+	ctx context.Context, state *adk.ChatModelAgentState, mc *adk.ModelContext,
+) (context.Context, *adk.ChatModelAgentState, error) {
+	newCtx, newState, err := w.inner.BeforeModelRewriteState(ctx, state, mc)
+	if err != nil {
+		logger.SugaredLogger.Warnf("summarization 中间件失败，跳过摘要压缩（Agent 继续运行）: %v", err)
+		return ctx, state, nil
+	}
+	return newCtx, newState, nil
+}
+
+// RootDir 返回 AI 智能体工作根目录（skills、memory、.learnings、SOUL.md/MEMORY.md 等所在目录）。
+//
+// 与 apppath.BaseDir 同一套「老位置优先」原则，保证任何已有智能体数据的用户都不会被搬到新位置：
+//  1. 环境变量 GO_STOCK_ROOT_DIR 显式覆盖（用于测试或指定部署目录）；
+//  2. 可执行文件所在目录若已存在智能体数据，沿用旧位置——覆盖 macOS 上曾用终端启动、
+//     数据落在 .app 包内的老用户；
+//  3. 否则使用 apppath.BaseDir()：Windows/Linux 即程序所在目录（与旧行为一致），
+//     macOS 双击 .app 时落到 ~/Library/Application Support/go-stock，不再随包升级被替换。
+//
+// 注意：本函数同时是 DeepAgents 文件系统沙箱与 Shell 的根目录，会被高频调用；
+// 有意不做进程级缓存，以保持 GO_STOCK_ROOT_DIR 每次读取的既有语义。
+func RootDir() string {
+	if env := strings.TrimSpace(os.Getenv("GO_STOCK_ROOT_DIR")); env != "" {
+		return env
+	}
+	if dir := apppath.ExeDir(); hasAgentData(dir) {
+		return dir
+	}
+	return apppath.BaseDir()
+}
+
+// hasAgentData 判断目录下是否已存在智能体数据，作为「老用户位置」的标记。
+func hasAgentData(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	for _, name := range []string{"skills", "memory", learningsDirName, soulFileName, memoryFileName} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func deepAgentRootDir() string {
+	return RootDir()
 }
 
 func errorRecoveryMiddleware() compose.ToolMiddleware {
 	return compose.ToolMiddleware{
 		Invokable: func(next compose.InvokableToolEndpoint) compose.InvokableToolEndpoint {
 			return func(ctx context.Context, input *compose.ToolInput) (output *compose.ToolOutput, err error) {
+				run := AgentRunFromContext(ctx)
+				// 同轮去重：只读工具的相同「工具+参数」调用直接复用本轮缓存结果，
+				// 不消耗预算、不打网络请求。有副作用工具（写入/发送/执行）不参与，
+				// 见 isDedupSafeTool。
+				cacheable := isDedupSafeTool(input.Name)
+				cacheKey := ""
+				if cacheable && run != nil {
+					cacheKey = toolDedupKey(input.Name, input.Arguments)
+					if cached, ok := run.LookupToolCache(cacheKey); ok {
+						message := "[本轮已执行过完全相同的调用，以下为本轮缓存结果，请勿重复调用]\n" + cached
+						RecordAgentRunTool(ctx, input.Name, "cached", input.Arguments, message)
+						if trace := AgentTurnTraceFromContext(ctx); trace != nil {
+							trace.RecordToolCall(input.Name, "cached", input.Arguments)
+						}
+						logger.SugaredLogger.Infof("工具调用命中本轮缓存: %s", input.Name)
+						return &compose.ToolOutput{Result: message}, nil
+					}
+				}
+				if run != nil {
+					if budgetErr := run.ReserveToolNamed(input.Name); budgetErr != nil {
+						message := fmt.Sprintf("工具调用已被运行预算拦截: %v。请基于已有数据回答，或明确告知用户任务未完成。", budgetErr)
+						RecordAgentRunTool(ctx, input.Name, "budget_exceeded", input.Arguments, message)
+						if trace := AgentTurnTraceFromContext(ctx); trace != nil {
+							trace.RecordToolCall(input.Name, "budget_exceeded", input.Arguments)
+						}
+						return &compose.ToolOutput{Result: wrapToolResultMetadata(input.Name, message, "budget_exceeded")}, nil
+					}
+					SetAgentRunPhase(ctx, "tool_calling")
+				}
+				RecordAgentRunTool(ctx, input.Name, "started", input.Arguments, "")
 				defer func() {
+					status := "error"
+					result := ""
+					if output != nil {
+						result = output.Result
+						status = detectToolResultStatus(result)
+					}
+					RecordAgentRunTool(ctx, input.Name, status, input.Arguments, result)
 					if r := recover(); r != nil {
 						logger.SugaredLogger.Errorf("工具调用 panic: %v\n%s", r, debug.Stack())
+						errMsg := fmt.Sprintf("工具调用异常: %v。请尝试其他方法或修正参数后重试。", r)
+						if trace := AgentTurnTraceFromContext(ctx); trace != nil {
+							trace.RecordToolCall(input.Name, "error", input.Arguments)
+						}
 						output = &compose.ToolOutput{
-							Result: fmt.Sprintf("工具调用异常: %v。请尝试其他方法或修正参数后重试。", r),
+							Result: wrapToolResultMetadata(input.Name, errMsg, "error"),
 						}
 						err = nil
 					}
 				}()
+				// 工具调用前预告：通过 channel 向前端发送 ReasoningContent 进度消息
+				sendToolProgress(ctx, buildToolPreflightMsg(input.Name, input.Arguments))
+				start := time.Now()
 				output, err = next(ctx, input)
+				// 瞬态错误（超时/连接重置/限流等）自动重试一次：网络抖动不应把
+				// 一次可恢复的失败抛给模型。重试不重复占用预算（同一次逻辑调用），
+				// 且父 ctx 已取消时跳过。
+				if err != nil && isTransientToolError(err) && ctx.Err() == nil {
+					logger.SugaredLogger.Warnf("工具 %s 瞬态错误，%dms 后自动重试一次: %v", input.Name, toolRetryBackoff, err)
+					select {
+					case <-time.After(time.Duration(toolRetryBackoff) * time.Millisecond):
+					case <-ctx.Done():
+					}
+					if ctx.Err() == nil {
+						output, err = next(ctx, input)
+						if err == nil {
+							logger.SugaredLogger.Infof("工具 %s 瞬态重试成功", input.Name)
+						}
+					}
+				}
+				elapsed := time.Since(start)
 				if err != nil {
 					logger.SugaredLogger.Warnf("工具调用出错: %v", err)
+					if trace := AgentTurnTraceFromContext(ctx); trace != nil {
+						trace.RecordToolCallWithElapsed(input.Name, "error", input.Arguments, elapsed)
+					}
+					errMsg := fmt.Sprintf("工具调用出错: %v。请尝试其他方法或修正参数后重试。", err)
 					return &compose.ToolOutput{
-						Result: fmt.Sprintf("工具调用出错: %v。请尝试其他方法或修正参数后重试。", err),
+						Result: wrapToolResultMetadata(input.Name, errMsg, "error"),
 					}, nil
 				}
-				if output != nil && len(output.Result) > 8000 {
-					output.Result = trimToolResult(output.Result, 4000)
+				if output != nil {
+					status := detectToolResultStatus(output.Result)
+					if trace := AgentTurnTraceFromContext(ctx); trace != nil {
+						trace.RecordToolCallWithElapsed(input.Name, status, input.Arguments, elapsed)
+					}
+					output.Result = wrapToolResultMetadata(input.Name, output.Result, status)
+					if len(output.Result) > 8000 {
+						output.Result = trimToolResult(ctx, output.Result, 4000)
+					}
+					// 成功结果写入同轮去重缓存（仅只读工具；错误结果不缓存，允许修正后重试）
+					if cacheable && run != nil && (status == "ok" || status == "empty") {
+						run.StoreToolCache(cacheKey, output.Result)
+					}
+					// 工具调用后摘要：发送结果摘要到前端
+					sendToolProgress(ctx, buildToolResultSummaryMsg(input.Name, output.Result, elapsed))
 				}
+				SetAgentRunPhase(ctx, "executing")
 				return output, nil
 			}
 		},
 		Streamable: func(next compose.StreamableToolEndpoint) compose.StreamableToolEndpoint {
 			return func(ctx context.Context, input *compose.ToolInput) (output *compose.StreamToolOutput, err error) {
+				if run := AgentRunFromContext(ctx); run != nil {
+					// 流式工具（execute 等）多为有副作用操作：只套用单工具上限，
+					// 不参与去重缓存与瞬态重试。
+					if budgetErr := run.ReserveToolNamed(input.Name); budgetErr != nil {
+						message := fmt.Sprintf("工具调用已被运行预算拦截: %v。请基于已有数据回答，或明确告知用户任务未完成。", budgetErr)
+						RecordAgentRunTool(ctx, input.Name, "budget_exceeded", input.Arguments, message)
+						if trace := AgentTurnTraceFromContext(ctx); trace != nil {
+							trace.RecordToolCall(input.Name, "budget_exceeded", input.Arguments)
+						}
+						return &compose.StreamToolOutput{
+							Result: schema.StreamReaderFromArray([]string{
+								wrapToolResultMetadata(input.Name, message, "budget_exceeded"),
+							}),
+						}, nil
+					}
+					SetAgentRunPhase(ctx, "tool_calling")
+				}
+				RecordAgentRunTool(ctx, input.Name, "started", input.Arguments, "")
 				defer func() {
 					if r := recover(); r != nil {
 						logger.SugaredLogger.Errorf("工具调用(stream) panic: %v\n%s", r, debug.Stack())
+						errMsg := fmt.Sprintf("工具调用异常: %v。请尝试其他方法或修正参数后重试。", r)
+						RecordAgentRunTool(ctx, input.Name, "error", input.Arguments, errMsg)
 						output = &compose.StreamToolOutput{
 							Result: schema.StreamReaderFromArray([]string{
-								fmt.Sprintf("工具调用异常: %v。请尝试其他方法或修正参数后重试。", r),
+								wrapToolResultMetadata(input.Name, errMsg, "error"),
 							}),
 						}
 						err = nil
 					}
 				}()
+				sendToolProgress(ctx, buildToolPreflightMsg(input.Name, input.Arguments))
+				start := time.Now()
 				output, err = next(ctx, input)
+				elapsed := time.Since(start)
 				if err != nil {
 					logger.SugaredLogger.Warnf("工具调用出错(stream): %v", err)
+					if trace := AgentTurnTraceFromContext(ctx); trace != nil {
+						trace.RecordToolCallWithElapsed(input.Name, "error", input.Arguments, elapsed)
+					}
+					errMsg := fmt.Sprintf("工具调用出错: %v。请尝试其他方法或修正参数后重试。", err)
+					RecordAgentRunTool(ctx, input.Name, "error", input.Arguments, errMsg)
 					return &compose.StreamToolOutput{
 						Result: schema.StreamReaderFromArray([]string{
-							fmt.Sprintf("工具调用出错: %v。请尝试其他方法或修正参数后重试。", err),
+							wrapToolResultMetadata(input.Name, errMsg, "error"),
 						}),
 					}, nil
 				}
+				if trace := AgentTurnTraceFromContext(ctx); trace != nil {
+					trace.RecordToolCallWithElapsed(input.Name, "ok", input.Arguments, elapsed)
+				}
+				RecordAgentRunTool(ctx, input.Name, "ok", input.Arguments, "stream result")
+				SetAgentRunPhase(ctx, "executing")
 				return output, nil
 			}
 		},
@@ -326,44 +846,61 @@ func buildSkillPrompt(question string) string {
 	return sb.String()
 }
 
-func GetAllTools() []tool.BaseTool {
-	var allTools []tool.BaseTool
-	allTools = append(allTools, tools.GetQueryStockCodeInfoTool())
-	allTools = append(allTools, tools.GetQueryStockNewsTool())
-	//allTools = append(allTools, tools.GetIndustryResearchReportTool())
-	allTools = append(allTools, tools.GetQueryBKDictTool())
+// staticToolsOnce 静态内置工具只需构造一次：所有工具实现均为无状态
+// （固定 name/params/handler，运行状态经 ctx 传递），每问重建百级对象
+// 纯属浪费。MCP 工具不在此处——它们走独立的指纹+TTL 缓存（mcp_tools_cache.go）。
+var (
+	staticToolsOnce sync.Once
+	staticToolsVal  []tool.BaseTool
+)
 
-	allTools = append(allTools, tools.GetAllDataTools()...)
+// buildStaticTools 返回静态内置工具列表（进程级单例）。
+// 调用方不得在返回切片上原地 append（会写共享底层数组），需先拷贝。
+func buildStaticTools() []tool.BaseTool {
+	staticToolsOnce.Do(func() {
+		var allTools []tool.BaseTool
+		allTools = append(allTools, tools.GetQueryStockCodeInfoTool())
+		allTools = append(allTools, tools.GetQueryStockNewsTool())
+		allTools = append(allTools, tools.GetQueryBKDictTool())
 
-	allTools = append(allTools, tools.GetHolidayTools()...)
+		allTools = append(allTools, tools.GetAllDataTools()...)
 
-	allTools = append(allTools, tools.GetMCPServerTools()...)
-	//allTools = append(allTools, tools.GetSkillTools()...)
+		allTools = append(allTools, tools.GetHolidayTools()...)
 
-	mcpTools := getMCPTools()
-	if len(mcpTools) > 0 {
-		allTools = append(allTools, mcpTools...)
-	}
+		// 长期记忆检索工具：让 Agent 在回答过程中可主动召回历史问答经验
+		allTools = append(allTools, NewSearchLongTermMemoryTool())
 
-	return allTools
+		// 自定义知识库工具：让 Agent 可检索用户上传的文档（按主题分多个 KB）
+		allTools = append(allTools, NewListKnowledgeBasesTool())
+		allTools = append(allTools, NewSearchKnowledgeBaseTool())
+		// 跨所有 KB + 长期记忆统一检索工具：一次调用聚合所有知识源
+		allTools = append(allTools, NewSearchAllKnowledgeTool())
+
+		// DeepSeek 联网搜索/网页抓取工具：补充本地数据工具未覆盖的实时网络信息
+		// （API Key 在设置页配置，未配置时工具执行会返回提示，不影响注册）
+		allTools = append(allTools, NewWebSearchTool())
+		allTools = append(allTools, NewWebFetchTool())
+
+		// 用户画像工具：让 Agent 读取/更新用户偏好画像（走安全 API 写，不依赖文件系统沙箱）
+		allTools = append(allTools, NewGetUserProfileTool())
+		allTools = append(allTools, NewUpdateUserProfileTool())
+
+		// MCP 服务管理工具：让 AI 能查询/管理 mcp_servers 与 mcp_server_tools
+		// （ListMCPServers / ListMCPServerTools / GetMCPToolDetail / Create/Update/Enable/TestMCPServer 等）。
+		allTools = append(allTools, tools.GetMCPServerTools()...)
+
+		staticToolsVal = allTools
+	})
+	return staticToolsVal
 }
 
-func getToolsByQuestion(question string) []tool.BaseTool {
-	var allTools []tool.BaseTool
+func getToolsByQuestion(question string, mcpCtx mcpInjectContext, alwaysIncludeMCP bool) []tool.BaseTool {
+	// 拷贝单例切片再追加 MCP 工具：避免 append 写入共享底层数组
+	allTools := append([]tool.BaseTool(nil), buildStaticTools()...)
 
-	allTools = append(allTools, tools.GetQueryStockCodeInfoTool())
-	allTools = append(allTools, tools.GetQueryStockNewsTool())
-	//allTools = append(allTools, tools.GetIndustryResearchReportTool())
-	allTools = append(allTools, tools.GetQueryBKDictTool())
-
-	allTools = append(allTools, tools.GetAllDataTools()...)
-
-	allTools = append(allTools, tools.GetHolidayTools()...)
-
-	allTools = append(allTools, tools.GetMCPServerTools()...)
-	//allTools = append(allTools, tools.GetSkillTools()...)
-
-	mcpTools := getMCPTools()
+	// 外部 MCP 工具：React/PlanExecute 按问题 + 技能声明 + 系统提示词决定注入谁；
+	// DeepAgents 恒保留，交由 ToolSearch 中间件动态检索。避免 MCP 工具 schema 每轮固定占用 token。
+	mcpTools := maybeGetMCPTools(question, mcpCtx, alwaysIncludeMCP)
 	if len(mcpTools) > 0 {
 		allTools = append(allTools, mcpTools...)
 	}
@@ -371,10 +908,365 @@ func getToolsByQuestion(question string) []tool.BaseTool {
 	groups := tools.ClassifyQuestion(question)
 	filtered := tools.FilterToolsByGroups(allTools, groups)
 
-	logger.SugaredLogger.Infof("tool grouping: question=%q, matched_groups=%v, total=%d, filtered=%d",
-		question, groupNames(groups), len(allTools), len(filtered))
+	logger.SugaredLogger.Infof("tool grouping: question=%q, matched_groups=%v, total=%d, filtered=%d, include_mcp=%v",
+		question, groupNames(groups), len(allTools), len(filtered), len(mcpTools) > 0)
 
 	return filtered
+}
+
+// mcpInjectContext 承载「问题之外」的 MCP 注入线索。
+//
+// 问题文本由 question 参数单独传入；此处只补充系统提示词与技能声明两条线索。
+// 两条线索的强弱不同，注入粒度也不同（见 selectMCPToolsForQuestion）。
+type mcpInjectContext struct {
+	// promptHint 系统提示词中由「用户/技能/模板配置」决定的文本（不含运行时追加的
+	// 静态规则、记忆、会话上下文）——用户把服务器名/工具名写进提示词即为强意图。
+	//
+	// 提示词侧只认强信号（服务器名、工具全名），**不做关键词窗口匹配**：系统提示词
+	// 动辄数千字，窗口匹配几乎必然命中，会把大量无关工具 schema 拖进每轮上下文。
+	promptHint string
+	// skillServerIDs 本轮生效技能显式声明的 MCP 服务器 ID（DB skills.mcp_server_ids）。
+	// 技能声明＝用户在技能配置里点名依赖，直接整台注入，保证技能的多步调用链路完整。
+	skillServerIDs []uint
+}
+
+// mcpInjectContextFor 组装注入线索：系统提示词文本 + 本轮生效技能声明的服务器。
+func mcpInjectContextFor(question, promptHint string) mcpInjectContext {
+	return mcpInjectContext{
+		promptHint:     promptHint,
+		skillServerIDs: activeSkillMCPServerIDs(question),
+	}
+}
+
+// maybeGetMCPTools 决定并加载外部 MCP 工具。
+//   - alwaysIncludeMCP：恒加载全部（DeepAgents 交由 ToolSearch 动态检索），并标记为动态工具。
+//   - 否则：先做廉价预判（问题/提示词命中服务器名、技能声明、问题含 MCP 相关信号、
+//     命中 mcp_server_tools 中已落库的工具名或描述），只有可能用到 MCP 时才初始化
+//     MCP 客户端；随后**按服务器**决定注入粒度——点名服务器（问题/提示词/技能声明）
+//     的整台注入，仅工具名/描述命中的只注入命中的工具并封顶（见 mcpMaxToolsPerServer）；
+//     完全不相关的服务器不注入，避免其 schema 每轮固定占用 token。
+//
+// 廉价预判与加载必须使用**同一份服务器集合**（activeMCPServers）：skill 显式依赖的
+// 服务器即使 Enable=false 也会被加载，若预判改用「启用且可用」的窄集合，这类服务器
+// 会在预判阶段被整体丢弃（React/PlanExecute 下工具直接消失，DeepAgents 却仍可用）。
+func maybeGetMCPTools(question string, mcpCtx mcpInjectContext, alwaysIncludeMCP bool) []tool.BaseTool {
+	servers := activeMCPServers()
+	if len(servers) == 0 {
+		return nil
+	}
+	// 廉价预判：仅字符串匹配，避免在无关问题上初始化 MCP 客户端（有成本）。
+	if !alwaysIncludeMCP && !mcpHintsRelevant(question, mcpCtx, servers) {
+		return nil
+	}
+
+	groups := loadMCPToolsForServers(servers)
+	if alwaysIncludeMCP {
+		// 标记为动态工具：DeepAgents 据此把 MCP 工具交给 ToolSearch 按需检索。
+		return tools.MarkMCPTools(flattenMCPTools(groups))
+	}
+
+	injected, hitServers, totalTools := selectMCPToolsForQuestion(question, mcpCtx, groups)
+	if len(injected) == 0 {
+		if len(hitServers) > 0 {
+			logger.SugaredLogger.Warnf("MCP 服务器命中但无工具可注入（连接失败或未暴露工具）: 命中服务器=%v, 候选工具=%d",
+				hitServers, totalTools)
+		}
+		return nil
+	}
+	logger.SugaredLogger.Infof("MCP 工具按服务器注入: 命中服务器=%v, 注入工具=%d/%d",
+		hitServers, len(injected), totalTools)
+	return tools.MarkMCPTools(injected)
+}
+
+// mcpHintsRelevant 廉价预判：问题或注入线索是否可能用到 MCP 工具。
+// 命中任一即放行到「加载 MCP 工具」阶段（建连有成本，无关问题直接跳过）。
+func mcpHintsRelevant(question string, mcpCtx mcpInjectContext, servers []models.MCPServer) bool {
+	// 技能显式声明依赖 → 必须加载（技能跑起来就是要用这些服务器）。
+	if len(mcpCtx.skillServerIDs) > 0 {
+		return true
+	}
+	names := mcpServerNameList(servers)
+	// 服务器名是强信号：问题里出现（用户点名）或提示词里出现（模板/技能指定）。
+	if mcpServerNamesMatchQuestion(question, names) || mcpServerNamesMatchQuestion(mcpCtx.promptHint, names) {
+		return true
+	}
+	// 通用信号词（"mcp"/"发送"/"机器人" 等），仅对问题生效。
+	if mcpRelevantHint(question) {
+		return true
+	}
+	return mcpPersistedToolsMatch(question, mcpCtx.promptHint, servers)
+}
+
+// mcpPersistedToolsMatch 用已落库的工具清单（mcp_server_tools 表）做廉价预判。
+//
+// 该表由「测试连接」写入，是本地可用的工具名/描述快照。预判原先只认服务器名与少量
+// 信号词，导致「问题与某工具高度相关但不含任何信号词」时整体跳过加载（工具用不上）。
+// 这里补上对落库工具名/描述的匹配：命中即放行到加载阶段，无关问题仍匹配不到而跳过建连。
+//
+// 问题侧走完整匹配（名称/片段/描述窗口），提示词侧只认工具全名——提示词是长文本，
+// 弱匹配必然命中（见 mcpInjectContext.promptHint）。
+func mcpPersistedToolsMatch(question, promptHint string, servers []models.MCPServer) bool {
+	if len(servers) == 0 {
+		return false
+	}
+	lowerQ := strings.ToLower(strings.TrimSpace(question))
+	lowerHint := strings.ToLower(promptHint)
+	if lowerQ == "" && strings.TrimSpace(lowerHint) == "" {
+		return false
+	}
+	ids := make([]uint, 0, len(servers))
+	// 服务器描述兜底：部分服务器不返回工具描述，只能借服务器描述做语义匹配
+	serverDesc := make(map[uint]string, len(servers))
+	for _, s := range servers {
+		ids = append(ids, s.ID)
+		serverDesc[s.ID] = s.Description
+	}
+	var rows []models.MCPServerTool
+	if err := db.Dao.Where("mcp_server_id IN ?", ids).Find(&rows).Error; err != nil {
+		logger.SugaredLogger.Warnf("读取 mcp_server_tools 预判失败: %v", err)
+		return false
+	}
+	for _, r := range rows {
+		desc := r.Description
+		if strings.TrimSpace(desc) == "" {
+			desc = serverDesc[r.MCPServerID]
+		}
+		if mcpToolMatchesQuestion(lowerQ, r.ToolName, desc) || mcpToolNamedInText(lowerHint, r.ToolName) {
+			return true
+		}
+	}
+	return false
+}
+
+// mcpMaxToolsPerServer 内容命中（未点名服务器）时单台服务器最多注入的工具数。
+// 命中的工具往往同族（如多个 get_*_rate），封顶可避免一个弱命中把大服务器
+// （如 westock-mcp 的 81 个工具）整台 schema 带进上下文；点名服务器不受此限。
+const mcpMaxToolsPerServer = 12
+
+// selectMCPToolsForQuestion 从按服务器分组的 MCP 工具中挑选要注入的工具。
+// 返回：注入的工具、命中的服务器名、候选工具总数。
+//
+// 两种注入粒度：
+//   - 点名服务器 → 整台注入：同服务器的工具常需配合使用（先列会话再发消息），按工具
+//     裁剪会切断多步调用链路。「点名」有三种来源：问题里出现服务器名（用户直接要求）、
+//     本轮生效技能声明依赖该服务器（配置里指定）、系统提示词里出现服务器名（模板指定）；
+//   - 仅工具名/描述命中 → 只注入命中的工具并封顶，避免弱命中放大成整台 schema。
+//     提示词侧在此档只认工具全名（强信号），不做描述窗口匹配。
+func selectMCPToolsForQuestion(question string, mcpCtx mcpInjectContext, groups []mcpServerTools) (injected []tool.BaseTool, hitServers []string, total int) {
+	// 技能声明的服务器按 ID 对齐（跳过 0：非持久化服务器无法被技能声明引用）。
+	skillServers := make(map[uint]bool, len(mcpCtx.skillServerIDs))
+	for _, id := range mcpCtx.skillServerIDs {
+		if id != 0 {
+			skillServers[id] = true
+		}
+	}
+	for _, g := range groups {
+		total += len(g.tools)
+		if serverNameMatchesQuestion(question, g.serverName) ||
+			skillServers[g.serverID] ||
+			serverNameMatchesQuestion(mcpCtx.promptHint, g.serverName) {
+			injected = append(injected, g.tools...)
+		} else {
+			matched := mcpMatchedTools(question, mcpCtx.promptHint, g.tools, g.serverDesc)
+			if len(matched) == 0 {
+				continue
+			}
+			injected = append(injected, matched...)
+		}
+		if g.serverName != "" {
+			hitServers = append(hitServers, g.serverName)
+		}
+	}
+	return injected, hitServers, total
+}
+
+// mcpServerNamesMatchQuestion 判断文本（问题或系统提示词）是否命中任一 MCP 服务器名。
+// 入参必须是加载器使用的同一份服务器集合（见 maybeGetMCPTools）。
+func mcpServerNamesMatchQuestion(text string, names []string) bool {
+	for _, n := range names {
+		if serverNameMatchesQuestion(text, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// mcpServerNameList 提取服务器名（用于问题/提示词匹配），跳过空名。
+func mcpServerNameList(servers []models.MCPServer) []string {
+	names := make([]string, 0, len(servers))
+	for _, s := range servers {
+		if strings.TrimSpace(s.Name) != "" {
+			names = append(names, s.Name)
+		}
+	}
+	return names
+}
+
+// serverNameMatchesQuestion 判断文本（问题/系统提示词）是否包含指定服务器名
+// （不区分大小写，忽略空白差异）。
+//
+// 忽略空白是必须的：MCP 服务器名常被配置成带前导/内部空格（如 " 加密货币 "、
+// "A 股标的宇宙"），用户自然提问不会照抄这些空格，直接子串匹配会整体漏召。
+func serverNameMatchesQuestion(question, serverName string) bool {
+	name := stripSpacesLower(serverName)
+	if name == "" {
+		return false
+	}
+	return strings.Contains(stripSpacesLower(question), name)
+}
+
+// stripSpacesLower 去掉全部空白字符并转小写，用于「忽略空白差异」的名称匹配
+// （"A 股标的宇宙" 与 "A股标的宇宙" 视为同名）。
+func stripSpacesLower(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(s), ""))
+}
+
+// mcpRelevantHint 判断问题是否含 MCP 相关信号（服务器名之外的通用提示词），
+// 作为是否值得初始化 MCP 客户端做工具匹配的廉价预判。
+func mcpRelevantHint(question string) bool {
+	hints := []string{"mcp", "工具", "调用", "发送", "通知", "消息", "服务器", "server",
+		"webhook", "api", "查询外部", "机器人", "slack", "钉钉", "飞书", "企业微信"}
+	lowerQ := strings.ToLower(question)
+	for _, h := range hints {
+		if strings.Contains(lowerQ, strings.ToLower(h)) {
+			return true
+		}
+	}
+	return false
+}
+
+// mcpMatchedTools 返回某服务器工具中与问题（或系统提示词）相关的工具，
+// 最多 mcpMaxToolsPerServer 个。
+//
+// serverDesc 为该服务器的描述：部分 MCP 服务器只下发工具名、不下发工具描述，
+// 此时服务器描述是唯一可用的语义线索，作为空描述工具的兜底匹配依据。
+//
+// 问题侧与提示词侧的匹配强度不同：问题侧走名称/名称片段/描述窗口，提示词侧只认
+// 工具全名——系统提示词是长文本，弱匹配会把整台工具的 schema 都拖进上下文。
+func mcpMatchedTools(question, promptHint string, mcpTools []tool.BaseTool, serverDesc string) []tool.BaseTool {
+	if len(mcpTools) == 0 {
+		return nil
+	}
+	lowerQ := strings.ToLower(strings.TrimSpace(question))
+	lowerHint := strings.ToLower(promptHint)
+	if lowerQ == "" && strings.TrimSpace(lowerHint) == "" {
+		return nil
+	}
+	var matched []tool.BaseTool
+	for _, t := range mcpTools {
+		info, err := t.Info(context.Background())
+		if err != nil || info == nil {
+			continue
+		}
+		desc := info.Desc
+		if strings.TrimSpace(desc) == "" {
+			desc = serverDesc
+		}
+		if !mcpToolMatchesQuestion(lowerQ, info.Name, desc) && !mcpToolNamedInText(lowerHint, info.Name) {
+			continue
+		}
+		matched = append(matched, t)
+		if len(matched) >= mcpMaxToolsPerServer {
+			break
+		}
+	}
+	return matched
+}
+
+// mcpToolNamedInText 判断文本中是否完整出现工具名（提示词侧的强信号）。
+//
+// 只认全名，不做名称片段/描述窗口匹配：系统提示词动辄数千字，任意 2 字窗口几乎必然
+// 命中，弱匹配会把大量无关工具的 schema 每轮固定带进上下文。用户在提示词里写
+// "调用 create_issue" 这类全名才是明确指定。
+func mcpToolNamedInText(lowerText, name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "" || strings.TrimSpace(lowerText) == "" {
+		return false
+	}
+	return strings.Contains(lowerText, n)
+}
+
+// mcpToolMatchesQuestion 判断单个工具是否与问题相关（lowerQ 需已转小写）。
+// 匹配方式：工具全名、按分隔符/驼峰拆分的名称片段、以及描述中与问题共享的关键词窗口。
+func mcpToolMatchesQuestion(lowerQ, name, desc string) bool {
+	if name != "" && strings.Contains(lowerQ, strings.ToLower(name)) {
+		return true
+	}
+	for _, part := range splitNameParts(name) {
+		if len(part) >= 2 && strings.Contains(lowerQ, strings.ToLower(part)) {
+			return true
+		}
+	}
+	if desc != "" && sharedWindowsMatch(lowerQ, desc) {
+		return true
+	}
+	return false
+}
+
+// splitNameCamelRe 在「小写/数字 → 大写」的驼峰边界匹配（捕获前后两个字符），
+// splitNameSepRe 匹配下划线/空白分隔符。
+//
+// Go regexp 使用 RE2 语法，不支持 lookahead/lookbehind（(?=...) / (?<=...)），
+// 故无法用 `(?<=[a-z0-9])(?=[A-Z])` 零宽断言做驼峰分割——regexp.MustCompile 会
+// 直接 panic（被 newStockAiAgent 的 recover 捕获，表现为「AI 配置不存在或无效」）。
+// 改为先用捕获组在边界插入空格、再按分隔符分割的等价写法。正则提到包级避免重复编译。
+var (
+	splitNameCamelRe = regexp.MustCompile(`([a-z0-9])([A-Z])`)
+	splitNameSepRe   = regexp.MustCompile(`[_\s]+`)
+)
+
+// splitNameParts 将工具名按下划线、双下划线（MCP 服务器/工具分隔符）及驼峰边界拆分。
+func splitNameParts(name string) []string {
+	expanded := splitNameCamelRe.ReplaceAllString(name, "$1 $2")
+	parts := splitNameSepRe.Split(expanded, -1)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// sharedWindowsMatch 检查 desc 中是否出现 question 的任一 2~4 字窗口。
+// 用于中英文都适用的"问题与工具描述共享关键词"匹配（中文无需分词）。
+//
+// 纯 ASCII 窗口（如 "on"、"py"、"1 "）在英文描述里几乎必然出现，2~3 字窗口会把
+// 任意问题判成相关（负样本误召的主因，一个弱命中还会带出整台服务器 schema），
+// 故纯 ASCII 窗口要求长度 ≥4；含中文的窗口 2 字即有区分度，保持原样。
+func sharedWindowsMatch(lowerQuestion, desc string) bool {
+	lowerDesc := strings.ToLower(desc)
+	q := []rune(lowerQuestion)
+	if len(q) < 2 {
+		return false
+	}
+	maxWin := len(q)
+	if maxWin > 4 {
+		maxWin = 4
+	}
+	for w := 2; w <= maxWin; w++ {
+		for i := 0; i+w <= len(q); i++ {
+			win := q[i : i+w]
+			if w < 4 && isASCIIWindow(win) {
+				continue
+			}
+			if strings.Contains(lowerDesc, string(win)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isASCIIWindow 判断窗口是否全为 ASCII 字符（英文/数字/标点），用于区分
+// 「英文短窗口」与「中文短窗口」的匹配强度。
+func isASCIIWindow(win []rune) bool {
+	for _, r := range win {
+		if r >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }
 
 func groupNames(groups map[tools.ToolGroup]bool) []string {
@@ -385,14 +1277,24 @@ func groupNames(groups map[tools.ToolGroup]bool) []string {
 	return names
 }
 
-func getMCPTools() []tool.BaseTool {
-	var mcpTools []tool.BaseTool
+// mcpServerTools 一个 MCP 服务器及其工具。
+// 按服务器粒度保留分组信息，便于只注入与问题相关的服务器，而不是命中一个就整包注入。
+type mcpServerTools struct {
+	serverID uint
+	// serverName 服务器名，用于问题/提示词点名匹配。
+	serverName string
+	// serverDesc 服务器描述，作为该服务器下「工具描述为空」时的兜底匹配依据。
+	serverDesc string
+	tools      []tool.BaseTool
+}
 
+// activeMCPServers 返回当前应加载的 MCP 服务器：启用且 available 的服务器，
+// 再补齐被 skill 引用但状态为 available 的服务器（skill 显式依赖即视为需要）。
+func activeMCPServers() []models.MCPServer {
 	var servers []models.MCPServer
-	err := db.Dao.Where("enable = ? AND status = ?", true, "available").Find(&servers).Error
-	if err != nil {
+	if err := db.Dao.Where("enable = ? AND status = ?", true, "available").Find(&servers).Error; err != nil {
 		logger.SugaredLogger.Errorf("获取MCP服务器列表失败: %v", err)
-		return mcpTools
+		return nil
 	}
 
 	skillServerIDs := getSkillMCPServerIDs()
@@ -411,40 +1313,124 @@ func getMCPTools() []tool.BaseTool {
 			}
 		}
 	}
+	return servers
+}
 
+// loadMCPToolsGroupedByServer 按服务器加载 MCP 工具（保留服务器名）。
+func loadMCPToolsGroupedByServer() []mcpServerTools {
+	return loadMCPToolsForServers(activeMCPServers())
+}
+
+// mcpLoadConcurrency MCP 工具并行重建的并发上限：多台服务器同时冷启动时
+// 建连握手并行进行，限制并发避免瞬时打满连接与对端限流。
+const mcpLoadConcurrency = 8
+
+// loadMCPToolsForServers 按服务器加载 MCP 工具（保留服务器名）。
+//
+// 按服务器走全局缓存（指纹+TTL 失效），避免每个问题重连所有 MCP 服务器。
+// 命中时微秒级返回；未命中（首次/配置变更/TTL 过期）才建连拉取。
+// 未命中的服务器并行重建（上限 mcpLoadConcurrency），冷加载耗时从
+// 各服务器耗时之和降为最慢单台耗时；缓存层按服务器粒度加锁，无竞态。
+func loadMCPToolsForServers(servers []models.MCPServer) []mcpServerTools {
 	if len(servers) == 0 {
-		return mcpTools
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	for _, server := range servers {
+	results := make([]mcpServerTools, len(servers))
+	sem := make(chan struct{}, mcpLoadConcurrency)
+	var wg sync.WaitGroup
+	for i := range servers {
+		server := servers[i]
 		if server.URL == "" {
 			continue
 		}
-
-		cli, err := data.InitMCPClient(ctx, &server)
-		if err != nil {
-			logger.SugaredLogger.Errorf("MCP客户端初始化失败 [%s]: %v", server.Name, err)
-			continue
-		}
-
-		mcpToolList, err := einomcp.GetTools(ctx, &einomcp.Config{Cli: cli})
-		if err != nil {
-			logger.SugaredLogger.Errorf("获取MCP工具列表失败 [%s]: %v", server.Name, err)
-			continue
-		}
-
-		if len(mcpToolList) > 0 {
-			logger.SugaredLogger.Infof("从MCP服务器 [%s] 加载了 %d 个工具", server.Name, len(mcpToolList))
-			mcpTools = append(mcpTools, mcpToolList...)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[i] = mcpServerTools{
+				serverID:   server.ID,
+				serverName: server.Name,
+				serverDesc: server.Description,
+				tools:      getMCPToolsForServer(ctx, &server),
+			}
+		}()
 	}
+	wg.Wait()
 
+	groups := make([]mcpServerTools, 0, len(servers))
+	activeIDs := make(map[uint]bool, len(servers))
+	for _, r := range results {
+		if r.serverID == 0 {
+			continue // URL 为空被跳过的槽位
+		}
+		activeIDs[r.serverID] = true
+		groups = append(groups, r)
+	}
+	sweepStaleMCPToolsCache(activeIDs)
+
+	return groups
+}
+
+// flattenMCPTools 把按服务器分组的工具扁平化为一个列表。
+func flattenMCPTools(groups []mcpServerTools) []tool.BaseTool {
+	var mcpTools []tool.BaseTool
+	for _, g := range groups {
+		mcpTools = append(mcpTools, g.tools...)
+	}
 	return mcpTools
 }
 
+// getMCPTools 返回所有启用 MCP 服务器的全部工具（扁平列表）。
+// DeepAgents 走此路径：全部 MCP 工具交给 ToolSearch 动态检索。
+func getMCPTools() []tool.BaseTool {
+	return flattenMCPTools(loadMCPToolsGroupedByServer())
+}
+
+// activeSkillMCPServerIDs 返回「本轮生效技能」显式声明的 MCP 服务器 ID。
+//
+// 生效判定＝技能触发词命中问题；**未配置触发词的技能不参与**——否则每个问题都会注入
+// 它声明的服务器，退化成常驻注入。
+//
+// 注意这与 buildSkillPrompt 的「无触发词则恒匹配」语义不同。buildSkillPrompt 目前没有
+// 调用方（历史死代码），此处不沿用其宽松语义，也不去改它以免影响其它潜在调用方。
+func activeSkillMCPServerIDs(question string) []uint {
+	skills := data.NewSkillApi().GetEnabledSkills()
+	if len(skills) == 0 {
+		return nil
+	}
+	var ids []uint
+	seen := make(map[uint]bool)
+	for _, skill := range skills {
+		if skill.MCPServerIDs == "" || !skillTriggersQuestion(skill.TriggerKeywords, question) {
+			continue
+		}
+		for _, id := range data.NewSkillApi().GetMCPServerIDs(&skill) {
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
+}
+
+// skillTriggersQuestion 判断技能触发词是否命中问题（逗号分隔，任一命中即可）。
+func skillTriggersQuestion(triggerKeywords, question string) bool {
+	for _, kw := range strings.Split(triggerKeywords, ",") {
+		if kw = strings.TrimSpace(kw); kw != "" && strings.Contains(question, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// getSkillMCPServerIDs 返回所有启用技能声明的 MCP 服务器 ID（不看触发词），
+// 用于决定「加载」哪些服务器：技能引用的服务器即使 Enable=false 也要能加载。
 func getSkillMCPServerIDs() []uint {
 	skills := data.NewSkillApi().GetEnabledSkills()
 	var ids []uint
@@ -485,11 +1471,13 @@ func genPlannerInput(ctx context.Context, userInput []adk.Message) ([]adk.Messag
 
 	systemMsg := schema.SystemMessage(`你是一个任务规划助手。请将用户的问题拆解为3-5个具体的执行步骤。
 规则：
-1. 每个步骤必须具体、可独立执行
-2. 步骤之间按逻辑顺序排列
-3. 最后一个步骤必须是汇总分析并给出最终答案
-4. 你必须通过调用 plan 工具来输出计划（参数为JSON格式，包含 steps 字段，值为字符串数组）
-5. 不要仅用文字描述计划，必须实际调用 plan 工具`)
+1. 每个步骤必须具体、可独立执行，且标明要调用的工具名称（格式：「调用XX工具：...」）
+2. 第一步建议：调用 GetCurrentTime 确认当前时间；若涉及具体股票，调用 QueryStockCodeInfo 解析代码
+3. 涉及股价、涨跌幅、财务指标等数字的步骤，必须指定 GetStockInfo / GetStockFinancialInfo 等数据工具，禁止写「分析基本面」等模糊步骤
+4. 步骤之间按逻辑顺序排列
+5. 最后一个步骤必须是汇总分析并给出最终答案（仅基于前面工具返回的数据）
+6. 你必须通过调用 plan 工具来输出计划（参数为JSON格式，包含 steps 字段，值为字符串数组）
+7. 不要仅用文字描述计划，必须实际调用 plan 工具`)
 
 	userMsg := schema.UserMessage(question)
 
@@ -667,9 +1655,22 @@ func smartContentCompress(content string, maxBytes int) string {
 		return content
 	}
 
-	lines := normalizeCompressLines(content)
+	metaLines, body := splitToolMetadataPrefix(content)
+	metaBytes := 0
+	if len(metaLines) > 0 {
+		metaBytes = len(joinToolMetadataAndBody(metaLines, ""))
+		if metaBytes >= maxBytes {
+			return safeTruncateString(joinToolMetadataAndBody(metaLines, ""), maxBytes)
+		}
+	}
+	bodyBudget := maxBytes - metaBytes
+	if bodyBudget < 1 {
+		bodyBudget = 1
+	}
+
+	lines := normalizeCompressLines(body)
 	if len(lines) == 0 {
-		return ""
+		return joinToolMetadataAndBody(metaLines, "")
 	}
 
 	var normJoined strings.Builder
@@ -680,8 +1681,8 @@ func smartContentCompress(content string, maxBytes int) string {
 		normJoined.WriteString(ln)
 	}
 	nj := normJoined.String()
-	if len(nj) <= maxBytes {
-		return nj
+	if len(nj) <= bodyBudget {
+		return joinToolMetadataAndBody(metaLines, nj)
 	}
 
 	var headers, dataLines, summaryLines, otherLines []string
@@ -706,7 +1707,7 @@ func smartContentCompress(content string, maxBytes int) string {
 			if used > 0 {
 				need++
 			}
-			if used+need > maxBytes {
+			if used+need > bodyBudget {
 				return false
 			}
 			result = append(result, p)
@@ -716,18 +1717,18 @@ func smartContentCompress(content string, maxBytes int) string {
 	}
 
 	// 1) 标题：保留前缀，且单独设上限，避免大量「#」标题占满预算
-	headerCap := maxBytes / 5
+	headerCap := bodyBudget / 5
 	if headerCap > 1000 {
 		headerCap = 1000
 	}
 	if headerCap < 120 && len(headers) > 0 {
-		headerCap = min(maxBytes/3, 400)
+		headerCap = min(bodyBudget/3, 400)
 	}
 	tryAdd(smartTruncateLines(headers, headerCap))
 
-	remaining := maxBytes - used
+	remaining := bodyBudget - used
 	if remaining < 1 {
-		return strings.Join(result, "\n")
+		return joinToolMetadataAndBody(metaLines, strings.Join(result, "\n"))
 	}
 
 	// 2) 摘要：约 35% 剩余预算，从尾部取（「综上所述」等常出现在末尾）
@@ -737,13 +1738,13 @@ func smartContentCompress(content string, maxBytes int) string {
 	}
 	tryAdd(smartTruncateLinesFromEnd(summaryLines, summaryBudget))
 
-	remaining = maxBytes - used
+	remaining = bodyBudget - used
 	if remaining < 1 {
 		out := strings.Join(result, "\n")
-		if len(out) > maxBytes {
-			return safeTruncateString(out, maxBytes)
+		if len(out) > bodyBudget {
+			out = safeTruncateString(out, bodyBudget)
 		}
-		return out
+		return joinToolMetadataAndBody(metaLines, out)
 	}
 
 	// 3) 数据行：约 55% 剩余预算，从尾部取（最新行情/指标常靠后）
@@ -753,16 +1754,16 @@ func smartContentCompress(content string, maxBytes int) string {
 	}
 	tryAdd(smartTruncateLinesFromEnd(dataLines, dataBudget))
 
-	remaining = maxBytes - used
+	remaining = bodyBudget - used
 	if remaining > 48 {
 		tryAdd(smartTruncateLinesFromEnd(otherLines, remaining))
 	}
 
 	finalContent := strings.Join(result, "\n")
-	if len(finalContent) > maxBytes {
-		finalContent = safeTruncateString(finalContent, maxBytes)
+	if len(finalContent) > bodyBudget {
+		finalContent = safeTruncateString(finalContent, bodyBudget)
 	}
-	return finalContent
+	return joinToolMetadataAndBody(metaLines, finalContent)
 }
 
 // compressExecutedStepResult 将已完成步骤的结果注入 executor/replanner 提示时的分级压缩：
@@ -824,6 +1825,11 @@ func isHeaderLine(line string) bool {
 
 // isDataLine 判断是否为数据行
 func isDataLine(line string) bool {
+	// Markdown 表格行（以 | 开头，工具返回的常见格式）
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "|") && strings.Contains(trimmed, "|") {
+		return true
+	}
 	// 包含数字和百分比的行
 	return strings.Contains(line, "%") ||
 		strings.Contains(line, "亿元") ||
@@ -964,9 +1970,10 @@ func genExecutorInput(ctx context.Context, in *planexecute.ExecutionContext) ([]
 
 	systemMsg := schema.SystemMessage(`你是一个任务执行助手。请按照计划执行当前步骤，通过调用可用的工具获取所需数据，并给出该步骤的分析结果。
 注意：
-1. 只执行当前步骤，不要跳过
-2. 充分利用工具获取真实数据，不要编造数据
-3. 给出简洁、精准的分析结果`)
+1. 只执行当前步骤，不要跳过；若步骤中指定了工具名，必须调用该工具
+2. 充分利用工具获取真实数据，不要编造数据；工具返回 status=empty/error 时如实说明，不得补数
+3. 回答中的具体数字必须来自本轮工具返回（含 [as_of=...] 元数据），不得引用训练记忆或历史对话；但 [as_of=...] 等元数据标记仅供内部判断，严禁写进回答正文
+4. 给出简洁、精准的分析结果`)
 
 	userMsg := schema.UserMessage(fmt.Sprintf("用户问题: %s\n\n当前计划:\n%s\n\n已完成的步骤及结果:\n%s\n【请执行当前步骤】: %s",
 		question, string(planContent), stepsContent.String(), in.Plan.FirstStep()))

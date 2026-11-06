@@ -1,14 +1,18 @@
 <script setup>
-import {h, onBeforeMount, onMounted, ref, reactive} from 'vue'
+import {h, onBeforeMount, onMounted, ref, reactive, watch, computed} from 'vue'
 import {
   GetAllStockInfoList,
   GetAllStocks,
-  GetConfig, GetSponsorInfo
+  GetConfig, GetSponsorInfo, GetEffectiveSponsorVip, Follow, GetGroupList, AddStockGroup, AddGroup, ExportTableToXLSX
 } from "../../wailsjs/go/main/App";
-import {NButton, NInput, NTag, NText, useMessage, useNotification, NDataTable, NSpace, NPagination} from "naive-ui";
+import {NButton, NInput, NTag, NText, useMessage, useNotification, NDataTable, NSpace, NPagination, NDropdown, NIcon} from "naive-ui";
 import sparkLine from "./stockSparkLine.vue"
 import klineChart from "./KLineChart.vue"
 import KLineChart from "./KLineChart.vue";
+import StockLightweightKlineChart from "./StockLightweightKlineChart.vue";
+import { KLINE_MODAL_CONTENT_STYLE, KLINE_MODAL_STYLE, useKlineModalFit } from "./kline/useKlineModalFit";
+import { EventsEmit } from "../../wailsjs/runtime";
+import {FolderOpenOutline, AddOutline, DownloadOutline} from "@vicons/ionicons5";
 import {format} from "date-fns";
 
 const notify = useNotification()
@@ -48,6 +52,7 @@ onBeforeMount(() => {
 onMounted(() => {
   console.log('stock-list mounted')
   loadStocks(1, paginationReactive.pageSize)
+  loadGroupList()
 })
 
 const dataRef = ref([])
@@ -57,6 +62,145 @@ const vipStartTime=ref("");
 const vipEndTime=ref("");
 const expired=ref(false)
 const isValidVip=ref(false) // 是否是会员
+
+// 多周期 K 线（VIP2）
+const effectiveVipLevel = ref(0)
+const multiKlineModalShow = ref(false)
+const multiKlineCode = ref('')
+const multiKlineName = ref('')
+
+// K 线弹窗尺寸与图表高度自适应：与全站其他 K 线弹窗统一
+const klineWrapRef = ref(null)
+const { chartHeight: klineChartHeight, attach: attachKlineFit, detach: detachKlineFit } = useKlineModalFit(klineWrapRef)
+watch(multiKlineModalShow, (v) => {
+  if (v) {
+    attachKlineFit()
+    return
+  }
+  detachKlineFit()
+})
+
+async function refreshEffectiveVip() {
+  try {
+    const r = await GetEffectiveSponsorVip()
+    const active = !!r?.active
+    const lvl = Number(r?.vipLevel ?? 0)
+    effectiveVipLevel.value = active && !Number.isNaN(lvl) ? lvl : 0
+  } catch (_) {
+    effectiveVipLevel.value = 0
+  }
+}
+
+function toEastMoneyCodeFromSecucode(secucode) {
+  if (!secucode) return ''
+  const c = String(secucode).trim()
+  if (/\.(SH|SZ|BJ|HK|US|SS)$/i.test(c)) return c.toUpperCase()
+  const lower = c.toLowerCase()
+  if (lower.startsWith('sh')) return lower.slice(2) + '.SH'
+  if (lower.startsWith('sz')) return lower.slice(2) + '.SZ'
+  if (lower.startsWith('bj')) return lower.slice(2) + '.BJ'
+  if (lower.startsWith('hk')) return lower.slice(2).toUpperCase() + '.HK'
+  if (lower.startsWith('us')) return lower.slice(2).toUpperCase() + '.US'
+  return c.toUpperCase()
+}
+
+async function showMultiKline(row) {
+  const em = toEastMoneyCodeFromSecucode(row.SECUCODE)
+  if (!em) {
+    message.warning('当前代码暂不支持多周期K线图')
+    return
+  }
+  await refreshEffectiveVip()
+  if (effectiveVipLevel.value < 2) {
+    message.warning('多周期 K 线仅限 VIP2 及以上用户使用，您当前权限不足')
+    return
+  }
+  multiKlineCode.value = em
+  multiKlineName.value = row.SECURITY_NAME_ABBR || ''
+  multiKlineModalShow.value = true
+}
+
+// 关注分组选择
+const groupList = ref([])
+const showFollowGroupModal = ref(false)
+const newGroupName = ref('')
+const pendingFollowRow = ref(null)
+
+const followGroupOptions = computed(() => {
+  const opts = [{label: '默认（不分组）', key: 0}]
+  groupList.value.forEach(g => opts.push({label: g.name, key: g.ID}))
+  opts.push({type: 'divider', key: 'divider'})
+  opts.push({label: '新建分组', key: 'new', icon: () => h(NIcon, null, {default: () => h(AddOutline)})})
+  return opts
+})
+
+function loadGroupList() {
+  GetGroupList().then(res => {
+    groupList.value = res || []
+  }).catch(() => {})
+}
+
+function handleFollowSelect(key, row) {
+  if (key === 'new') {
+    pendingFollowRow.value = row
+    newGroupName.value = ''
+    showFollowGroupModal.value = true
+    return
+  }
+  doFollow(row, Number(key))
+}
+
+function doFollow(row, groupId) {
+  let code = getStockCode(row.SECUCODE)
+  Follow(code).then(result => {
+    if (result === '关注成功') {
+      message.success(groupId > 0 ? `已关注，并加入分组「${groupNameById(groupId)}」` : '关注成功')
+    } else {
+      message.info(result)
+    }
+    if (groupId > 0) {
+      AddStockGroup(groupId, code).then(() => {
+        loadGroupList()
+      }).catch(() => {})
+    }
+  }).catch(err => {
+    message.error('关注失败: ' + err)
+  })
+}
+
+function groupNameById(id) {
+  const g = groupList.value.find(item => item.ID === id)
+  return g ? g.name : ''
+}
+
+function handleCreateGroupAndFollow() {
+  const name = newGroupName.value.trim()
+  if (!name) {
+    message.warning('请输入分组名称')
+    return
+  }
+  const maxSort = groupList.value.reduce((max, g) => Math.max(max, g.sort || 0), 0)
+  AddGroup({name, sort: maxSort + 1}).then(res => {
+    if (res === '添加成功') {
+      GetGroupList().then(list => {
+        groupList.value = list || []
+        // 通知 App.vue 菜单栏立即刷新分组子项
+        EventsEmit("groupListChanged")
+        showFollowGroupModal.value = false
+        const created = groupList.value.find(g => g.name === name)
+        if (created && pendingFollowRow.value) {
+          doFollow(pendingFollowRow.value, created.ID)
+        }
+        pendingFollowRow.value = null
+      })
+    } else {
+      message.error(res)
+    }
+  }).catch(err => {
+    message.error('新建分组失败: ' + err)
+  })
+}
+
 const columnsRef = ref([
   // {
   //   title: '数据时间',
@@ -236,6 +380,40 @@ const columnsRef = ref([
             onClick: () => showKline(row)
           },
           { default: () => '日K' }
+      ), h(
+          NButton,
+          {
+            secondary: true,
+            size: 'small',
+            type: 'primary',
+            style: 'margin-left: 4px;',
+            onClick: () => showMultiKline(row)
+          },
+          { default: () => '多周期' }
+      ), h(
+          NDropdown,
+          {
+            trigger: 'click',
+            options: followGroupOptions.value,
+            placement: 'bottom-end',
+            menuProps: () => ({ style: 'max-height:300px; overflow-y:auto;' }),
+            onSelect: (key) => handleFollowSelect(key, row)
+          },
+          {
+            default: () => h(
+                NButton,
+                {
+                  tertiary: true,
+                  size: 'small',
+                  type: 'success',
+                  style: 'margin-left: 4px;',
+                },
+                {
+                  default: () => '关注',
+                  icon: () => h(NIcon, null, {default: () => h(FolderOpenOutline, {size: 14})})
+                }
+            )
+          }
       ),]
     }
   },
@@ -302,6 +480,55 @@ function handlePageSizeChange(pageSize) {
 }
 function handleSearch() {
   loadStocks(1, paginationReactive.pageSize)
+}
+
+// 导出全部筛选结果为 Excel：按当前筛选条件拉全量（不只当前页），排除分时图/操作列
+function handleExport() {
+  const total = paginationReactive.itemCount || 0
+  if (!total) {
+    message.warning('当前没有可导出的数据')
+    return
+  }
+  const loading = message.loading('正在获取全量数据并导出...', {duration: 0})
+  GetAllStocks(1, total, paginationReactive.keyword, technicalIndicatorReactive).then(res => {
+    const rows = (res && res.result && res.result.data) || []
+    if (!rows.length) {
+      loading.destroy()
+      message.warning('没有获取到可导出的数据')
+      return
+    }
+    const exportColumns = [
+      {title: '股票代码', key: 'SECUCODE'},
+      {title: '股票名称', key: 'SECURITY_NAME_ABBR'},
+      {title: '最新价', key: 'NEW_PRICE'},
+      {title: '涨跌幅(%)', key: 'CHANGE_RATE'},
+      {title: '最高价', key: 'HIGH_PRICE'},
+      {title: '最低价', key: 'LOW_PRICE'},
+      {title: '成交量', key: 'VOLUME'},
+      {title: '成交额', key: 'DEAL_AMOUNT'},
+      {title: '换手率(%)', key: 'TURNOVERRATE'},
+      {title: '量比', key: 'VOLUME_RATIO'},
+      {title: '所属行业', key: 'INDUSTRY'},
+      {title: '所属概念', key: 'CONCEPT'},
+    ]
+    // 概念列可能是数组，导出为顿号分隔文本
+    const exportRows = rows.map(row => ({
+      ...row,
+      CONCEPT: Array.isArray(row.CONCEPT) ? row.CONCEPT.join('、') : row.CONCEPT,
+    }))
+    const fileName = `形态选股_${format(new Date(), 'yyyyMMdd')}.xlsx`
+    return ExportTableToXLSX(fileName, {
+      sheetName: '形态选股',
+      columns: exportColumns,
+      rows: exportRows,
+    }).then(path => {
+      loading.destroy()
+      if (path) message.success('已导出：' + path)
+    })
+  }).catch(err => {
+    loading.destroy()
+    message.error('导出失败: ' + (err?.message || err))
+  })
 }
 function handleUpdateVal(value) {
   console.log('handleUpdateVal', value)
@@ -594,6 +821,10 @@ const toNumber = (value, defaultValue = 0) => {
     <n-button type="primary" ghost @click="handleSearch"  @input="handleSearch">
       搜索
     </n-button>
+      <n-button type="success" ghost @click="handleExport" :disabled="!paginationReactive.itemCount">
+        <template #icon><n-icon :component="DownloadOutline" size="16"/></template>
+        导出
+      </n-button>
       <n-button @click="handleReset">重置</n-button>
 
     </n-input-group>
@@ -630,6 +861,34 @@ const toNumber = (value, defaultValue = 0) => {
     <n-card size="small">
       <KLineChart style="width: 100%;max-width: 800px;" :code="getStockCode(modalDataRef.stockCode)" :chart-height="500" :stock-name="modalDataRef.stockName" :k-days="30" :dark-theme="editorDataRef.darkTheme"></KLineChart>
     </n-card>
+  </n-modal>
+
+  <n-modal
+    v-model:show="multiKlineModalShow"
+    :title="(multiKlineName || '') + ' — 多周期K线'"
+    preset="card"
+    :style="KLINE_MODAL_STYLE"
+    :content-style="KLINE_MODAL_CONTENT_STYLE"
+  >
+    <div ref="klineWrapRef">
+      <StockLightweightKlineChart
+        v-if="multiKlineModalShow && multiKlineCode"
+        :key="'allstock-' + multiKlineCode"
+        :code="multiKlineCode"
+        :stock-name="multiKlineName"
+        :dark-theme="editorDataRef.darkTheme"
+        :chart-height="klineChartHeight"
+      />
+    </div>
+  </n-modal>
+
+  <n-modal v-model:show="showFollowGroupModal" preset="dialog" title="新建分组" positive-text="创建并关注" negative-text="取消"
+           @positive-click="handleCreateGroupAndFollow" style="width: 420px;">
+    <n-form label-placement="left" label-width="80">
+      <n-form-item label="分组名称">
+        <n-input v-model:value="newGroupName" placeholder="请输入分组名称" @keyup.enter="handleCreateGroupAndFollow"/>
+      </n-form-item>
+    </n-form>
   </n-modal>
 </template>
 

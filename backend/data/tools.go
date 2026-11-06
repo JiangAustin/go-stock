@@ -190,24 +190,6 @@ func Tools(tools []Tool) []Tool {
 	//	},
 	//})
 
-	//tools = append(tools, Tool{
-	//	Type: "function",
-	//	Function: ToolFunction{
-	//		Name:        "GetIndustryResearchReport",
-	//		Description: "获取行业/板块研究报告,请先使用QueryBKDictInfo工具获取行业代码，然后输入行业代码调用",
-	//		Parameters: FunctionParameters{
-	//			Type: "object",
-	//			Properties: map[string]any{
-	//				"bkCode": map[string]any{
-	//					"type":        "string",
-	//					"description": "板块/行业代码",
-	//				},
-	//			},
-	//			Required: []string{"bkCode"},
-	//		},
-	//	},
-	//})
-
 	tools = append(tools, Tool{
 		Type: "function",
 		Function: ToolFunction{
@@ -232,6 +214,10 @@ func Tools(tools []Tool) []Tool {
 		Function: ToolFunction{
 			Name:        "HotStrategyTable",
 			Description: "获取当前热门选股策略",
+			Parameters: &FunctionParameters{
+				Type:       "object",
+				Properties: map[string]any{},
+			},
 		},
 	})
 
@@ -479,6 +465,439 @@ func Tools(tools []Tool) []Tool {
 	tools = append(tools, Tool{
 		Type: "function",
 		Function: ToolFunction{
+			Name:        "GetTdxSymbolBelongBoard",
+			Description: "通过通达信MAC接口获取股票所属板块信息，包括行业板块、概念板块等，以及板块涨跌幅、涨停/跌停家数等数据。支持一次查询多只，将并行请求后合并结果。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码,如：600519.SH。注意 上海证券交易所股票以.SH结尾，深圳证券交易所股票以.SZ结尾，北交所股票以.BJ结尾，港股以.HK结尾。多只时可用英文逗号分隔。",
+					},
+					"stockCodes": toolSchemaStockCodes,
+				},
+				Required: []string{"stockCode"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetMACCapitalFlow",
+			Description: "通过通达信MAC接口获取个股资金流向数据，包括今日主力/散户流入流出及净流入、5日主力买卖净额与超大/大/中/小单净流入（单位：元）。主要支持A股。支持一次查询多只，将并行请求后合并结果。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码,如：600519.SH。注意 上海证券交易所股票以.SH结尾，深圳证券交易所股票以.SZ结尾，北交所股票以.BJ结尾。多只时可用英文逗号分隔。",
+					},
+					"stockCodes": toolSchemaStockCodes,
+				},
+				Required: []string{"stockCode"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "GetFuturesPosition",
+			Description: "获取股指期货（IF沪深300/IH上证50/IC中证500/IM中证1000）前20名会员的多空单持仓趋势，" +
+				"包括多单/空单持仓量及增减、净持仓（多单-空单）、结算价、现货指数收盘价与基差，可判断期指多空情绪与大盘走势的背离或共振。" +
+				"数据为盘后更新（约17:30后），主源东方财富，降级中金所官网。当用户询问期指多空单、股指期货持仓、净持仓、空头增减、市场多空情绪时使用。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"variety": map[string]any{
+						"type":        "string",
+						"description": "期指品种：IF（沪深300）、IH（上证50）、IC（中证500）、IM（中证1000），也支持中文名如 沪深300。",
+					},
+					"days": map[string]any{
+						"type":        "integer",
+						"description": "可选，返回最近多少个交易日，默认 20，最大 120。",
+					},
+					"includeMembers": map[string]any{
+						"type":        "boolean",
+						"description": "可选，是否附带最新交易日前20会员持仓明细龙虎榜（中金所），默认 false。",
+					},
+				},
+				Required: []string{"variety"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetStockLHBDetail",
+			Description: "通过通达信ICFQS接口获取个股龙虎榜席位明细，包含上榜日期、上榜类型、买卖方向与排名、营业部/游资名称、买入金额、卖出金额（单位：元）。用于分析游资与机构席位动向、判断资金性质（知名游资/机构专用/深股通等）。支持一次查询多只，将并行请求后合并结果。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码,如：600519.SH。多只时可用英文逗号分隔。",
+					},
+					"startDate": map[string]any{
+						"type":        "string",
+						"description": "可选，开始日期，格式 YYYY-MM-DD 或 YYYYMMDD。留空由服务端决定默认区间。",
+					},
+					"endDate": map[string]any{
+						"type":        "string",
+						"description": "可选，结束日期，格式 YYYY-MM-DD 或 YYYYMMDD。",
+					},
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": "可选，最多返回多少条记录，默认 40，最大 500。",
+					},
+					"stockCodes": toolSchemaStockCodes,
+				},
+				Required: []string{"stockCode"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetYYBLHBDetail",
+			Description: "通过通达信ICFQS接口按营业部名称查询龙虎榜明细，返回该营业部近期上榜的股票、买卖方向、金额与日期。用于跟踪知名游资营业部的操作轨迹。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"yybName": map[string]any{
+						"type":        "string",
+						"description": "营业部全称（接口为精确匹配，不支持模糊搜索），如：东方财富证券股份有限公司拉萨团结路第二证券营业部。建议直接使用 GetStockLHBDetail 返回结果中的营业部名称原值。",
+					},
+					"startDate": map[string]any{
+						"type":        "string",
+						"description": "可选，开始日期，格式 YYYY-MM-DD 或 YYYYMMDD。",
+					},
+					"endDate": map[string]any{
+						"type":        "string",
+						"description": "可选，结束日期，格式 YYYY-MM-DD 或 YYYYMMDD。",
+					},
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": "可选，最多返回多少条记录，默认 40，最大 500。",
+					},
+				},
+				Required: []string{"yybName"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetActiveCapitalDetail",
+			Description: "通过通达信ICFQS接口按游资/席位代码查询其买卖明细（上榜股票、营业部、买卖金额与日期）。用于追踪特定游资席位的操作风格与持仓方向。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"code": map[string]any{
+						"type":        "string",
+						"description": "游资或席位代码，如 000066。",
+					},
+					"startDate": map[string]any{
+						"type":        "string",
+						"description": "可选，开始日期，格式 YYYY-MM-DD 或 YYYYMMDD。",
+					},
+					"endDate": map[string]any{
+						"type":        "string",
+						"description": "可选，结束日期，格式 YYYY-MM-DD 或 YYYYMMDD。",
+					},
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": "可选，最多返回多少条记录，默认 40，最大 500。",
+					},
+				},
+				Required: []string{"code"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetTopicRotation",
+			Description: "通过通达信ICFQS接口获取主题/板块轮动排行，返回按涨跌幅排序的主题代码、名称、涨跌幅、日期与排名。用于判断当前市场主线题材、题材轮动方向。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"dataNum": map[string]any{
+						"type":        "integer",
+						"description": "取数范围：1=前后10 2=前10（默认） 3=前20 4=前30 5=后20 6=后30。",
+					},
+					"dataType": map[string]any{
+						"type":        "integer",
+						"description": "排序类型，默认 1，通常保持默认即可。",
+					},
+					"dataDate": map[string]any{
+						"type":        "integer",
+						"description": "日期口径，默认 2，通常保持默认即可。",
+					},
+					"themeType": map[string]any{
+						"type":        "string",
+						"description": "主题类型，默认 0（全部）。",
+					},
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": "可选，最多返回多少条，默认 30，最大 200。",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetHotTopics",
+			Description: "通过通达信ICFQS接口获取热门主题列表，每个主题包含主题代码、名称、事件日期、事件驱动描述与详情链接。适合快速了解当前市场最受关注的事件驱动型题材及其逻辑。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": "可选，最多返回多少条，默认 20，最大 100。",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetTopTopics",
+			Description: "通过通达信ICFQS接口获取领涨主题排行，返回主题代码与名称（按涨幅排名）。与 GetTopicRotation 搭配可定位最强题材。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"topN": map[string]any{
+						"type":        "integer",
+						"description": "可选，取前 N 个领涨主题，默认 10，最大 100。",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetTopicStocks",
+			Description: "通过通达信ICFQS接口获取指定主题的关联成分股列表，返回股票代码、名称、入选说明与收录日期。用于把一个题材拆解到具体标的。主题代码可从 GetHotTopics / GetTopTopics / GetTopicRotation 获取。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"code": map[string]any{
+						"type":        "string",
+						"description": "主题/板块代码，如 880904。",
+					},
+					"setcode": map[string]any{
+						"type":        "string",
+						"description": "主题所属类型代码，默认 2（板块指数）。",
+					},
+					"page": map[string]any{
+						"type":        "integer",
+						"description": "可选，页码，默认 1。",
+					},
+					"size": map[string]any{
+						"type":        "integer",
+						"description": "可选，每页数量，默认 30，最大 200。",
+					},
+				},
+				Required: []string{"code"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetTopicKLine",
+			Description: "通过通达信ICFQS接口获取指定主题的历史日线走势，包含日期、指数点位、涨跌幅与成交额，用于判断题材的持续性、是否处于加速或退潮阶段。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"code": map[string]any{
+						"type":        "string",
+						"description": "主题/板块代码，如 880904。",
+					},
+					"setcode": map[string]any{
+						"type":        "string",
+						"description": "主题所属类型代码，默认 2（板块指数）。",
+					},
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": "可选，最多返回最近多少个交易日，默认 30，最大 250。",
+					},
+				},
+				Required: []string{"code"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetMACBoardList",
+			Description: "通过通达信MAC接口获取板块列表（板块指数、涨速、代表个股）。可用于查看当前哪些板块走强、板块内部领涨个股。A股默认 boardType=0（行业板块涨幅榜）。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"boardType": map[string]any{
+						"type":        "integer",
+						"description": "板块类型，默认 0（A股行业板块涨幅榜）。其它取值部分为空，建议保持默认。",
+					},
+					"market": map[string]any{
+						"type":        "string",
+						"description": "市场：a=A股（默认，主行情节点）、hk/us=港股美股（扩展行情节点）。",
+					},
+					"count": map[string]any{
+						"type":        "integer",
+						"description": "可选，返回条数，默认 50，最大 300。",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetMACBoardMembers",
+			Description: "通过通达信MAC接口获取指定板块的成分股报价，包含最新价、涨跌幅、换手率、量比、PE(TTM)、成交额，默认按涨速降序。用于查看板块内个股强弱排序与龙头/补涨标的。板块代码可从 GetMACBoardList 或所属板块接口获取（如 880761）。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"boardSymbol": map[string]any{
+						"type":        "string",
+						"description": "板块代码，如 880761。",
+					},
+					"market": map[string]any{
+						"type":        "string",
+						"description": "市场：a=A股（默认）、hk/us=港股美股（扩展行情节点）。",
+					},
+					"sortType": map[string]any{
+						"type":        "integer",
+						"description": "排序字段类型，默认 14（涨速/涨幅）。",
+					},
+					"sortOrder": map[string]any{
+						"type":        "integer",
+						"description": "排序方向，默认 1（降序）。",
+					},
+					"count": map[string]any{
+						"type":        "integer",
+						"description": "可选，返回条数，默认 30，最大 200。",
+					},
+				},
+				Required: []string{"boardSymbol"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetMACMarketMonitor",
+			Description: "通过通达信MAC接口获取市场实时异动监控列表，包含异动个股代码/名称、时间、异动描述（如封涨停板、封跌停板）、异动值。用于即时发现盘中涨停、跌停、异动个股。非交易时段可能为空。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"market": map[string]any{
+						"type":        "string",
+						"description": "市场：all=深市+沪市（默认）、sz=深圳、sh=上海、bj=北京。",
+					},
+					"count": map[string]any{
+						"type":        "integer",
+						"description": "可选，每个市场返回条数，默认 30，最大 200。",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetMACSymbolInfo",
+			Description: "通过通达信MAC接口获取个股盘口摘要，包含昨收、今开、最高、最低、最新价、涨跌幅、涨速、成交量、成交额、内盘、外盘、换手率、量比、均价。支持一次查询多只。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码,如：600519.SH。多只时可用英文逗号分隔。",
+					},
+					"stockCodes": toolSchemaStockCodes,
+				},
+				Required: []string{"stockCode"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetTdxTickData",
+			Description: "通过通达信接口获取个股逐笔成交明细统计：成交笔数、总成交量/成交额、主动买/主动卖成交额与主动买占比，并列出成交额最大的若干笔大单（时间、价格、成交量、方向）。用于判断盘中大单资金方向与主力吸筹/派发。A股走标准协议，港美股走MAC协议。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码,如：600519.SH。多只时可用英文逗号分隔。",
+					},
+					"tradeDate": map[string]any{
+						"type":        "string",
+						"description": "可选，交易日，格式 YYYY-MM-DD 或 YYYYMMDD。留空为当日。",
+					},
+					"topN": map[string]any{
+						"type":        "integer",
+						"description": "可选，大单榜单条数，默认 15，最大 50。",
+					},
+					"stockCodes": toolSchemaStockCodes,
+				},
+				Required: []string{"stockCode"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetTdxMinuteTrend",
+			Description: "通过通达信接口获取个股分时走势（含当日概览与等间隔采样的分时点），可用于盘中分时形态判断（如分时均线支撑、尾盘拉升）。A股走标准协议，港美股走MAC协议。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码,如：600519.SH。多只时可用英文逗号分隔。",
+					},
+					"tradeDate": map[string]any{
+						"type":        "string",
+						"description": "可选，历史交易日，格式 YYYY-MM-DD 或 YYYYMMDD。留空为当日。",
+					},
+					"points": map[string]any{
+						"type":        "integer",
+						"description": "可选，分时采样点数量，默认 30，最大 100。",
+					},
+					"stockCodes": toolSchemaStockCodes,
+				},
+				Required: []string{"stockCode"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
 			Name:        "GetTdxCompanyCategory",
 			Description: "通过通达信协议获取股票F10分类信息。不传category参数时返回所有可用分类名称列表；传入category参数时返回该分类的详细内容。可用分类包括：最新提示、公司概况、财务分析、股本结构、股东研究、机构持股、分红融资、高管治理、资金动向、资本运作、热点题材、公司公告、公司报道、经营分析、行业分析、研报评级。",
 			Parameters: &FunctionParameters{
@@ -559,6 +978,10 @@ func Tools(tools []Tool) []Tool {
 		Function: ToolFunction{
 			Name:        "GlobalStockIndexesReadable",
 			Description: "获取全球主要指数概览，并输出为 AI 易读的 Markdown 结构化文本。",
+			Parameters: &FunctionParameters{
+				Type:       "object",
+				Properties: map[string]any{},
+			},
 		},
 	})
 
@@ -573,6 +996,28 @@ func Tools(tools []Tool) []Tool {
 					"title": map[string]any{
 						"type":        "string",
 						"description": "消息标题，会显示为「go-stock {title}」",
+					},
+					"message": map[string]any{
+						"type":        "string",
+						"description": "消息正文，支持 Markdown 格式，通知内容需尽可能精简",
+					},
+				},
+				Required: []string{"title", "message"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "SendToFeishu",
+			Description: "将指定标题和内容以 Markdown 卡片形式发送到飞书自定义机器人。用于把分析结果、摘要或通知推送到飞书群。需在设置中开启飞书推送并配置机器人 Webhook（可选填写签名校验 Secret）。通知内容需尽可能精简。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"title": map[string]any{
+						"type":        "string",
+						"description": "消息标题，会显示为卡片标题「go-stock {title}」",
 					},
 					"message": map[string]any{
 						"type":        "string",
@@ -855,6 +1300,10 @@ func Tools(tools []Tool) []Tool {
 		Function: ToolFunction{
 			Name:        "GetCurrentTime",
 			Description: "获取当前本地时间（格式：YYYY-MM-DD HH:mm:ss）及星期几",
+			Parameters: &FunctionParameters{
+				Type:       "object",
+				Properties: map[string]any{},
+			},
 		},
 	})
 
@@ -899,6 +1348,10 @@ func Tools(tools []Tool) []Tool {
 		Function: ToolFunction{
 			Name:        "GetMarketData",
 			Description: "获取市场行情数据，包括指数行情、涨跌分布和今日申购信息",
+			Parameters: &FunctionParameters{
+				Type:       "object",
+				Properties: map[string]any{},
+			},
 		},
 	})
 
@@ -1135,6 +1588,327 @@ func Tools(tools []Tool) []Tool {
 	tools = append(tools, Tool{
 		Type: "function",
 		Function: ToolFunction{
+			Name: "CleanupStockCodes",
+			Description: "扫描 followed_stock 和 group_stock_info 表，把不规范的 stock_code（后缀格式 600938.SH、纯数字 600938、大写 SH600938 等）" +
+				"归一化为前缀小写格式（sh600938）。遇到同一只股票两种格式都存在的重复记录，会合并 cost_price/volume 后删除重复。" +
+				"建议先以 dryRun=true 预览，确认后再以 dryRun=false 执行实际清理。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"dryRun": map[string]any{
+						"type":        "boolean",
+						"description": "是否仅预览不修改数据库。true=只扫描返回报告；false=执行实际清理（默认 false）",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "FollowStock",
+			Description: "关注（新增自选）一只股票，并可同时设置其附加信息：分组、概念标签、成本价、持仓量、止盈止损价位等。" +
+				"分组/概念不存在时自动创建，概念名称忽略大小写去重；美股代码 us 前缀会被自动归一化。" +
+				"若该股票已关注，仍会继续设置附加信息（幂等）。" +
+				"未传的可选参数会被跳过。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码，如 000001.SZ、sh600519、00700.HK、usaapl。上海.SH、深圳.SZ、港股.HK、北交所.BJ、美股 us 前缀。",
+					},
+					"groupNames": map[string]any{
+						"type":        "string",
+						"description": "可选，分组名称，多个用英文逗号分隔（如 白酒,消费）。不存在则自动创建。",
+					},
+					"conceptNames": map[string]any{
+						"type":        "string",
+						"description": "可选，概念标签名称，多个用英文逗号分隔（如 AI,芯片,新能源）。自动去重创建。",
+					},
+					"costPrice": map[string]any{
+						"type":        "number",
+						"description": "可选，持仓成本价，大于 0 生效。",
+					},
+					"volume": map[string]any{
+						"type":        "integer",
+						"description": "可选，持仓数量（股），大于 0 生效。",
+					},
+					"entryPrice": map[string]any{
+						"type":        "number",
+						"description": "可选，开仓价（价位线），大于 0 生效。",
+					},
+					"takeProfitPrice": map[string]any{
+						"type":        "number",
+						"description": "可选，止盈价（价位线），大于 0 生效。",
+					},
+					"stopLossPrice": map[string]any{
+						"type":        "number",
+						"description": "可选，止损价（价位线），大于 0 生效。",
+					},
+				},
+				Required: []string{"stockCode"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "AddDailyOperationPlan",
+			Description: "为指定股票创建一条「每日操作计划」，包含总体判断、多个情景方案（不同价格走势下的操作动作）、操作纪律、总结与风险提示，并可开启盘中价格预警。" +
+				"AI 在完成个股分析后，应主动调用此工具将操作建议结构化保存，方便用户在「每日操作计划」页面查看，并在盘中达到触发条件时自动推送通知。" +
+				"情景方案的 triggerPriceMin/Max（触发价区间）、stopLossPriceNum（止损价）、target1Min/Max、target2Min/Max 为量化字段，用于盘中预警监控，应尽量填写。" +
+				"actionType 取值：buy(买入)/wait(观望)/observe(观察)/stop_loss(止损离场)。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码，如 603986、000001.SZ、sh600519、00700.HK、usaapl。",
+					},
+					"stockName": map[string]any{
+						"type":        "string",
+						"description": "股票名称，如 兆易创新。",
+					},
+					"planDate": map[string]any{
+						"type":        "string",
+						"description": "计划开始日期，格式 YYYY-MM-DD。不传则默认为今天。",
+					},
+					"planEndDate": map[string]any{
+						"type":        "string",
+						"description": "计划结束日期，格式 YYYY-MM-DD。可选，不传或为空表示仅当天有效。",
+					},
+					"overallJudgment": map[string]any{
+						"type":        "string",
+						"description": "对该股的总体判断，包括基本面+技术面分析结论、是否可以买、仓位与止损要求等。",
+					},
+					"summary": map[string]any{
+						"type":        "string",
+						"description": "一句话总结整体操作方案。",
+					},
+					"riskWarning": map[string]any{
+						"type":        "string",
+						"description": "风险提示。可选，不传则使用默认风险提示文案。",
+					},
+					"enableAlert": map[string]any{
+						"type":        "boolean",
+						"description": "是否开启盘中价格预警监控，默认 true。开启后盘中每分钟监控实时价，达到触发条件时推送通知。",
+					},
+					"notifyChannels": map[string]any{
+						"type":        "array",
+						"description": "通知渠道数组，可选值：app(软件内提醒)、feishu(飞书)、dingding(钉钉)。不传则默认全部渠道。",
+						"items": map[string]any{
+							"type":        "string",
+							"description": "通知渠道：app / feishu / dingding",
+						},
+					},
+					"scenarios": map[string]any{
+						"type":        "array",
+						"description": "情景方案数组，按不同价格走势给出对应的操作动作。至少一个。",
+						"items": map[string]any{
+							"type":        "object",
+							"description": "单个情景方案",
+							"properties": map[string]any{
+								"title":            map[string]any{"type": "string", "description": "情景标题，如：情景一：低开/平开在 460-475 区间（最理想）"},
+								"condition":        map[string]any{"type": "string", "description": "触发条件描述，如 低开/平开在 460-475 区间"},
+								"actionType":       map[string]any{"type": "string", "description": "动作类型：buy(买入)/wait(观望)/observe(观察)/stop_loss(止损离场)", "enum": []string{"buy", "wait", "observe", "stop_loss"}},
+								"action":           map[string]any{"type": "string", "description": "动作描述，如 分批买入"},
+								"position":         map[string]any{"type": "string", "description": "仓位，如 总仓位1/3"},
+								"buyPriceRange":    map[string]any{"type": "string", "description": "买入区间，如 460-470元"},
+								"stopLossPrice":    map[string]any{"type": "string", "description": "止损价（文本），如 400元"},
+								"target1":          map[string]any{"type": "string", "description": "第一目标，如 500-505元（减仓1/2）"},
+								"target2":          map[string]any{"type": "string", "description": "第二目标，如 550-560元（全部止盈）"},
+								"strategy":         map[string]any{"type": "string", "description": "策略说明/备注"},
+								"isBest":           map[string]any{"type": "boolean", "description": "是否最理想情景，默认 false"},
+								"triggerPriceMin":  map[string]any{"type": "number", "description": "情景触发价下限，实时价进入[下限,上限]区间时触发情景提醒。0或省略表示不监控"},
+								"triggerPriceMax":  map[string]any{"type": "number", "description": "情景触发价上限"},
+								"stopLossPriceNum": map[string]any{"type": "number", "description": "止损价（数值），实时价<=此值触发止损预警。0或省略表示不监控"},
+								"target1Min":       map[string]any{"type": "number", "description": "第一目标价下限，实时价>=此值触发目标1达成"},
+								"target1Max":       map[string]any{"type": "number", "description": "第一目标价上限"},
+								"target2Min":       map[string]any{"type": "number", "description": "第二目标价下限，实时价>=此值触发目标2达成"},
+								"target2Max":       map[string]any{"type": "number", "description": "第二目标价上限"},
+							},
+						},
+					},
+					"discipline": map[string]any{
+						"type":        "array",
+						"description": "操作纪律数组，如仓位控制、严格止损等原则。可选。",
+						"items": map[string]any{
+							"type":        "object",
+							"description": "单条操作纪律",
+							"properties": map[string]any{
+								"principle": map[string]any{"type": "string", "description": "原则，如 仓位控制"},
+								"detail":    map[string]any{"type": "string", "description": "说明，如 首次建仓不超过总计划资金的1/3，留足子弹补仓"},
+							},
+						},
+					},
+				},
+				Required: []string{"stockCode", "stockName", "scenarios"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetDailyOperationPlanList",
+			Description: "查询每日操作计划列表，返回 Markdown 格式的计划详情（含情景方案、量化价位、操作纪律等），供 AI 分析。支持按股票代码/名称/日期/状态筛选。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "可选，按股票代码模糊筛选，如 603986",
+					},
+					"stockName": map[string]any{
+						"type":        "string",
+						"description": "可选，按股票名称模糊筛选，如 兆易创新",
+					},
+					"planDate": map[string]any{
+						"type":        "string",
+						"description": "可选，按计划日期筛选，格式 YYYY-MM-DD，如 2026-07-23",
+					},
+					"status": map[string]any{
+						"type":        "string",
+						"description": "可选，按状态筛选：pending=待执行，executing=执行中，done=已完成，cancelled=已取消",
+					},
+					"page": map[string]any{
+						"type":        "number",
+						"description": "页码，默认 1",
+					},
+					"pageSize": map[string]any{
+						"type":        "number",
+						"description": "每页条数，默认 20，最大 100",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "UpdateDailyOperationPlan",
+			Description: "编辑修改已有操作计划（部分更新，仅更新传入的字段，未传入字段保持原值）。需要先通过 GetDailyOperationPlanList 获取计划 ID。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"planId": map[string]any{
+						"type":        "number",
+						"description": "要编辑的操作计划 ID（必填）",
+					},
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码（可选，不传保持原值）",
+					},
+					"stockName": map[string]any{
+						"type":        "string",
+						"description": "股票名称（可选，不传保持原值）",
+					},
+					"planDate": map[string]any{
+						"type":        "string",
+						"description": "计划开始日期 YYYY-MM-DD（可选，不传保持原值）",
+					},
+					"planEndDate": map[string]any{
+						"type":        "string",
+						"description": "计划结束日期 YYYY-MM-DD（可选，不传保持原值。为空表示仅当天有效）",
+					},
+					"overallJudgment": map[string]any{
+						"type":        "string",
+						"description": "总体判断（可选，传入则覆盖）",
+					},
+					"scenarios": map[string]any{
+						"type":        "array",
+						"description": "情景方案数组（可选，传入则整体覆盖）。结构与 AddDailyOperationPlan 的 scenarios 相同",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"title":            map[string]any{"type": "string", "description": "情景标题"},
+								"condition":        map[string]any{"type": "string", "description": "触发条件"},
+								"actionType":       map[string]any{"type": "string", "description": "操作类型:buy/sell/watch"},
+								"action":           map[string]any{"type": "string", "description": "具体操作"},
+								"position":         map[string]any{"type": "string", "description": "仓位"},
+								"buyPriceRange":    map[string]any{"type": "string", "description": "买入区间"},
+								"stopLossPrice":    map[string]any{"type": "string", "description": "止损价"},
+								"target1":          map[string]any{"type": "string", "description": "第一目标"},
+								"target2":          map[string]any{"type": "string", "description": "第二目标"},
+								"strategy":         map[string]any{"type": "string", "description": "策略说明"},
+								"isBest":           map[string]any{"type": "boolean", "description": "是否最优"},
+								"triggerPriceMin":  map[string]any{"type": "number", "description": "触发价下限"},
+								"triggerPriceMax":  map[string]any{"type": "number", "description": "触发价上限"},
+								"stopLossPriceNum": map[string]any{"type": "number", "description": "止损价(数值)"},
+								"target1Min":       map[string]any{"type": "number", "description": "目标1下限"},
+								"target1Max":       map[string]any{"type": "number", "description": "目标1上限"},
+								"target2Min":       map[string]any{"type": "number", "description": "目标2下限"},
+								"target2Max":       map[string]any{"type": "number", "description": "目标2上限"},
+							},
+						},
+					},
+					"discipline": map[string]any{
+						"type":        "array",
+						"description": "操作纪律数组（可选，传入则整体覆盖）",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"principle": map[string]any{"type": "string", "description": "原则"},
+								"detail":    map[string]any{"type": "string", "description": "说明"},
+							},
+						},
+					},
+					"summary": map[string]any{
+						"type":        "string",
+						"description": "操作总结（可选）",
+					},
+					"riskWarning": map[string]any{
+						"type":        "string",
+						"description": "风险提示（可选）",
+					},
+					"status": map[string]any{
+						"type":        "string",
+						"description": "状态（可选）：pending/executing/done/cancelled",
+					},
+					"enableAlert": map[string]any{
+						"type":        "boolean",
+						"description": "是否开启盘中预警（可选）",
+					},
+					"notifyChannels": map[string]any{
+						"type":        "array",
+						"description": "通知渠道数组（可选）：app/feishu/dingding",
+						"items":       map[string]any{"type": "string"},
+					},
+				},
+				Required: []string{"planId"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "UpdateDailyOperationPlanStatus",
+			Description: "快速更新操作计划状态。需要计划 ID 和新状态值。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"planId": map[string]any{
+						"type":        "number",
+						"description": "操作计划 ID",
+					},
+					"status": map[string]any{
+						"type":        "string",
+						"description": "新状态：pending=待执行，executing=执行中，done=已完成，cancelled=已取消",
+					},
+				},
+				Required: []string{"planId", "status"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
 			Name:        "GetAIAnalysisHistory",
 			Description: "查询历史AI分析报告。可以根据股票代码、股票名称、问题关键词、日期范围等条件筛选历史AI分析记录。",
 			Parameters: &FunctionParameters{
@@ -1169,6 +1943,55 @@ func Tools(tools []Tool) []Tool {
 						"description": "每页条数，默认10",
 					},
 				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetTradingRecordList",
+			Description: "查询用户交易日志（买入/卖出记录）。可按股票代码或名称关键词、买卖方向、交易日期范围筛选，并支持分页。返回包含盈亏金额、盈亏率等信息。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"keyword": map[string]any{
+						"type":        "string",
+						"description": "股票代码或名称关键词（可选，模糊匹配）",
+					},
+					"direction": map[string]any{
+						"type":        "string",
+						"description": "交易方向筛选：买入 或 卖出，不传则返回全部",
+					},
+					"startDate": map[string]any{
+						"type":        "string",
+						"description": "交易时间起始日期，格式：YYYY-MM-DD（可选，含当日）",
+					},
+					"endDate": map[string]any{
+						"type":        "string",
+						"description": "交易时间结束日期，格式：YYYY-MM-DD（可选，含当日）",
+					},
+					"page": map[string]any{
+						"type":        "integer",
+						"description": "页码，默认1",
+					},
+					"pageSize": map[string]any{
+						"type":        "integer",
+						"description": "每页条数，默认20，最大50",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetTradingRecordStatistics",
+			Description: "获取用户交易日志的统计概况，包括累计买入/卖出金额、总盈亏、收益率、当前持仓数、持仓成本与市值，以及当日盈亏与收益率。基于全部历史记录按FIFO计算，无需传参。",
+			Parameters: &FunctionParameters{
+				Type:       "object",
+				Properties: map[string]any{},
 			},
 		},
 	})
@@ -1276,16 +2099,181 @@ func Tools(tools []Tool) []Tool {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        "GetLongTigerList",
-			Description: "获取龙虎榜数据（营业部排行榜）",
+			Description: "获取龙虎榜数据（营业部排行榜）。龙虎榜在交易日收盘后约17点发布，查询当日须在17点后，17点前或非交易日请传最近一个已发布的交易日期",
 			Parameters: &FunctionParameters{
 				Type: "object",
 				Properties: map[string]any{
 					"date": map[string]any{
 						"type":        "string",
-						"description": "查询日期，格式：2026-03-28，默认今天",
+						"description": "交易日期，格式：2026-03-28。龙虎榜收盘后约17点发布，17点前查当日会无数据，应传上一交易日",
 					},
 				},
 				Required: []string{"date"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetLhbSeatDetail",
+			Description: "获取个股某交易日龙虎榜买5卖5席位明细（游资/机构买卖数据），含营业部名称、买卖金额、占总成交比例、席位类型识别（机构专用/北向通道/知名游资/普通营业部）及游资昵称标签。龙虎榜在交易日收盘后约17点发布，查询当日须在17点后，17点前或非交易日请传最近一个已发布的交易日期",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码，如 600519、000001.SZ",
+					},
+					"date": map[string]any{
+						"type":        "string",
+						"description": "交易日期，格式：2026-03-28。龙虎榜收盘后约17点发布，17点前查当日会无数据，应传上一交易日",
+					},
+				},
+				Required: []string{"stockCode", "date"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetBkFundFlowRank",
+			Description: "获取板块/概念资金流向主力净流入排名TOP榜（如板块/概念资金流入流出前20名）。支持行业板块与概念板块、净流入榜与净流出榜；查询当天资金流向、板块轮动、主力资金动向时使用。返回板块代码与名称，可用 GetBkConstituentStocks 进一步查看成分股",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"boardType": map[string]any{
+						"type":        "string",
+						"description": "板块类型：industry=行业板块（默认），concept=概念板块，both=两者都查",
+					},
+					"direction": map[string]any{
+						"type":        "string",
+						"description": "方向：inflow=净流入榜，outflow=净流出榜，both=流入流出都查（默认）",
+					},
+					"date": map[string]any{
+						"type":        "string",
+						"description": "查询日期，格式：2026-09-08，为空取最新快照（非交易日自动回退最近交易日）",
+					},
+					"topN": map[string]any{
+						"type":        "number",
+						"description": "返回条数，默认20，最大100",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetBkConstituentStocks",
+			Description: "获取板块/概念的成分股列表TOP N，支持按涨跌幅、量比、换手率、总市值、流通市值、主力净流入、主力净流入占比、成交额升序/降序排序（如某板块主力净流入前20的成分股、板块内涨幅榜/换手率榜/市值龙头）。输入板块代码（BK0475，可从 GetBkFundFlowRank 获取）或名称（如 银行、机器人概念）",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"bkCodeOrName": map[string]any{
+						"type":        "string",
+						"description": "板块/概念代码或名称，如 BK0475、银行、机器人概念",
+					},
+					"sortBy": map[string]any{
+						"type":        "string",
+						"description": "排序字段：mainNetInflow=主力净流入（默认）、changePercent=涨跌幅、volumeRatio=量比、turnoverRate=换手率、totalMarketCap=总市值、flowMarketCap=流通市值、mainNetInflowPct=主力净流入占比、dealAmount=成交额",
+					},
+					"order": map[string]any{
+						"type":        "string",
+						"description": "排序方向：desc=降序（默认）、asc=升序",
+					},
+					"topN": map[string]any{
+						"type":        "number",
+						"description": "返回条数，默认20，最大50",
+					},
+				},
+				Required: []string{"bkCodeOrName"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetPolicyNewsList",
+			Description: "获取政府部门最新政策新闻列表（数据来自各部委官网，如发改委/央行/证监会/财政部等82个部门，按日期倒序去重）。支持按部门名称或关键词过滤（如 能源/数据/证监会），也可按关键词检索已入库的历史政策标题。分析政策利好利空、行业影响、政策动向时使用",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"department": map[string]any{
+						"type":        "string",
+						"description": "部门名称或关键词：支持部门全名（如 国家能源局）及名称关键词（如 能源 命中 国家能源局，数据 命中 国家数据局），为空则聚合全部部门",
+					},
+					"keyword": map[string]any{
+						"type":        "string",
+						"description": "标题关键词，如 新能源/人工智能/房地产，非空时检索已入库历史政策",
+					},
+					"limit": map[string]any{
+						"type":        "number",
+						"description": "返回条数，默认20，最大100",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetPolicyNewsDetail",
+			Description: "获取某条政策新闻的详情全文内容（抓取政策原文页面并提取正文，含标题与原文链接）。输入政策新闻列表（GetPolicyNewsList）或政策文件库检索（SearchGovPolicyLibrary）中返回的链接，用于深入分析具体政策条款、实施时间、适用范围等",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"url": map[string]any{
+						"type":        "string",
+						"description": "政策详情页链接，即 GetPolicyNewsList/SearchGovPolicyLibrary 返回的链接字段（*.gov.cn 域名）",
+					},
+				},
+				Required: []string{"url"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "SearchGovPolicyLibrary",
+			Description: "检索国务院政策文件库（sousuo.www.gov.cn 官方权威库，含国务院文件/部门文件/国务院公报等数万份正式政策文件，可查文号、发文机关、发布日期）。支持按发文机关（部门名称或关键词，如 能源/数据局/证监会）过滤。查询国家层面的正式政策文件、红头文件、法律法规原文时优先使用此工具；部委官网的新闻动态用 GetPolicyNewsList",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"keyword": map[string]any{
+						"type":        "string",
+						"description": "检索关键词，如 人工智能/新能源/住房公积金/新质生产力，为空则按发布时间返回最新文件",
+					},
+					"department": map[string]any{
+						"type":        "string",
+						"description": "发文机关：支持部门全名（如 商务部）及名称关键词（如 能源 命中 国家能源局，数据 命中 国家数据局）；含国务院时检索国务院本级文件（如 国务院办公厅）。为空则不过滤",
+					},
+					"searchField": map[string]any{
+						"type":        "string",
+						"description": "检索字段：title=按标题（默认），content=按正文全文",
+					},
+					"category": map[string]any{
+						"type":        "string",
+						"description": "文件类别：gongwen=国务院文件，bumenfile=部门文件，otherfile=其他文件（政策解读等），gongbao=国务院公报；为空合并全部类别",
+					},
+					"sortBy": map[string]any{
+						"type":        "string",
+						"description": "排序方式：score=按相关度（默认），pubtime=按发布时间倒序",
+					},
+					"page": map[string]any{
+						"type":        "number",
+						"description": "页码，默认 1，用于翻页获取更多结果",
+					},
+					"limit": map[string]any{
+						"type":        "number",
+						"description": "每页条数，默认 20，最大 50",
+					},
+				},
 			},
 		},
 	})
@@ -1733,13 +2721,31 @@ func Tools(tools []Tool) []Tool {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        "GetStockLatestFinance",
-			Description: "获取股票最新财务主要数据，包括每股收益(EPS)、每股净资产(BPS)、净资产收益率(ROE)、营业收入、净利润及同比/环比增速等。数据来源于东方财富F10。",
+			Description: "获取A股股票最新财务主要数据，包括每股收益(EPS)、每股净资产(BPS)、净资产收益率(ROE)、营业收入、净利润及同比/环比增速等。数据来源于东方财富F10（HSF10，沪深京A股市场）。仅适用于A股（沪市/深市/北交所），港股请使用 GetHKStockLatestFinance，美股暂不支持。",
 			Parameters: &FunctionParameters{
 				Type: "object",
 				Properties: map[string]any{
 					"stockCode": map[string]any{
 						"type":        "string",
-						"description": "股票代码，如 600519、000001.SZ、600000.SH",
+						"description": "A股股票代码，支持 600519、000001.SZ、600000.SH、830799.BJ 等格式",
+					},
+				},
+				Required: []string{"stockCode"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetHKStockLatestFinance",
+			Description: "获取港股股票最新财务主要指标，包括基本/稀释每股收益、TTM每股收益、每股净资产、每股经营现金流、营业总收入、毛利润、归母净利润、同比/环比增速、平均/年化净资产收益率、毛利率、净利率、资产负债率、流动比率等。数据来源于东方财富港股F10（HKF10）。仅适用于港股（.HK 后缀，如 00700.HK 腾讯控股、09988.HK 阿里巴巴）。A股请使用 GetStockLatestFinance。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "港股股票代码，支持 00700.HK、00700、hk00700 等格式",
 					},
 				},
 				Required: []string{"stockCode"},
@@ -1955,7 +2961,7 @@ func Tools(tools []Tool) []Tool {
 				Properties: map[string]any{
 					"date": map[string]any{
 						"type":        "string",
-						"description": "查询日期，格式：2026-04-17，默认今天",
+						"description": "查询日期，格式：2026-04-17；留空自动回退到最近有数据的交易日（非交易日无数据）",
 					},
 				},
 			},
@@ -1972,7 +2978,7 @@ func Tools(tools []Tool) []Tool {
 				Properties: map[string]any{
 					"date": map[string]any{
 						"type":        "string",
-						"description": "查询日期，格式：2026-04-17，默认今天",
+						"description": "查询日期，格式：2026-04-17；留空自动回退到最近有数据的交易日（非交易日无数据）",
 					},
 				},
 			},
@@ -1989,7 +2995,7 @@ func Tools(tools []Tool) []Tool {
 				Properties: map[string]any{
 					"date": map[string]any{
 						"type":        "string",
-						"description": "查询日期，格式：2026-04-17，默认今天",
+						"description": "查询日期，格式：2026-04-17；留空自动回退到最近有数据的交易日（非交易日无数据）",
 					},
 				},
 			},
@@ -2006,7 +3012,7 @@ func Tools(tools []Tool) []Tool {
 				Properties: map[string]any{
 					"date": map[string]any{
 						"type":        "string",
-						"description": "查询日期，格式：2026-04-17，默认今天",
+						"description": "查询日期，格式：2026-04-17；留空自动回退到最近有数据的交易日（非交易日无数据）",
 					},
 				},
 			},
@@ -2188,9 +3194,402 @@ func Tools(tools []Tool) []Tool {
 		},
 	})
 
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "MarkdownToImage",
+			Description: "将 Markdown 文本或本地 Markdown 文件渲染为 PNG 图片并保存到本地文件，返回图片的绝对路径。" +
+				"输入支持两种形式（二选一，同时提供时优先 markdown 内联文本）：markdown 直接传入文本；" +
+				"filePath 传入本地文件路径（如 D:\\docs\\report.md，相对路径优先按工作目录解析、失败后回退程序所在目录）。" +
+				"渲染基于无头 Chrome，自动跟随应用深色/浅色主题，支持标题、表格、代码块、列表、加粗、涨跌红绿着色等 Markdown 排版，" +
+				"适合把较长的分析报告、表格密集型内容生成图片以便查看、分享或存档。" +
+				"当用户要求把内容转成图片、生成图片、导出为图片、做成长图时使用。" +
+				"注意：渲染耗时约 1~3 秒；输入内容超过 200KB 会直接失败。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"markdown": map[string]any{
+						"type":        "string",
+						"description": "要渲染的 Markdown 内联文本，支持标题、表格、代码块、列表、加粗等语法。与 filePath 二选一，同时提供时优先使用本参数。",
+					},
+					"filePath": map[string]any{
+						"type":        "string",
+						"description": "本地 Markdown 文件路径（.md/.markdown/.txt 等文本文件），如 D:\\docs\\report.md 或 report.md。与 markdown 二选一；相对路径优先按进程工作目录解析，失败后回退到程序所在目录。",
+					},
+					"filename": map[string]any{
+						"type":        "string",
+						"description": "可选的输出文件名（不含 .png 扩展名），默认取 filePath 文件基名或按时间戳自动生成；仅允许字母、数字、中文、下划线与中横线。",
+					},
+				},
+			},
+		},
+	})
+
+	// 币安 USDT-M 永续合约（加密资产，24/7 交易）
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "GetBinanceFuturesMarket",
+			Description: "获取币安 USDT-M 永续合约行情榜单（24/7 交易的加密资产）。返回合约、最新价、24h涨跌幅、24h成交额、标记价、当期资金费率与下次结算时间。" +
+				"symbol 参数支持中文别名容错（如「比特币」「BTC」「btc/usdt」均可）。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"sort": map[string]any{
+						"type":        "string",
+						"description": "排序方式：percent=按24h涨跌幅（默认），amount=按24h成交额，funding=按当期资金费率绝对值。",
+					},
+					"limit": map[string]any{
+						"type":        "number",
+						"description": "返回条数，默认 20，最大 100。",
+					},
+					"symbols": map[string]any{
+						"type":        "string",
+						"description": "可选，指定合约并忽略排序，如 btc,eth,sol 或 bn:btcusdt，英文逗号分隔。",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "GetBinanceFuturesKLine",
+			Description: "获取币安 USDT-M 永续合约 K 线数据。注意：币安 K 线以 UTC 为界（日K 为 UTC 00:00），与 A股/港股交易日不同。symbol 支持中文别名。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"symbol": map[string]any{
+						"type":        "string",
+						"description": "合约标识，如 btc、比特币、btc/usdt、BTCUSDT、bn:btcusdt。",
+					},
+					"interval": map[string]any{
+						"type":        "string",
+						"description": "K 线周期：day/日/101=日K，week/周/102=周K，month/月/103=月K，quarter/季/104、halfYear/半年/105、year/年/106 均归为月K；分钟线：1/5/15/30/60/120/240。",
+					},
+					"limit": map[string]any{
+						"type":        "number",
+						"description": "K 线根数，默认 90，最大 1500。",
+					},
+				},
+				Required: []string{"symbol"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "GetBinanceFuturesDerivatives",
+			Description: "获取币安 USDT-M 永续合约的衍生指标：资金费率（当期/近期均值/年化）、未平仓量 OI（当期与区间变化率）、多空比（全局账户比/大户持仓比/主动买卖比）。" +
+				"用于判断杠杆情绪与多空拥挤度。symbol 支持中文别名。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"symbol": map[string]any{
+						"type":        "string",
+						"description": "合约标识，如 btc、比特币、btc/usdt、BTCUSDT、bn:btcusdt。",
+					},
+					"period": map[string]any{
+						"type":        "string",
+						"description": "历史采样周期：5m/15m/30m/1h/2h/4h/6h/12h/1d，默认 1h。",
+					},
+					"limit": map[string]any{
+						"type":        "number",
+						"description": "历史序列条数，默认 48，最大 120。",
+					},
+				},
+				Required: []string{"symbol"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "GetBitgetFuturesMarket",
+			Description: "获取 Bitget 美股永续合约（RWA，24/7 交易的美股映射合约）行情榜单。返回标的、最新价、24h涨跌幅、24h成交额、标记价、当期资金费率。" +
+				"symbol 参数支持中文别名容错（如「苹果」「AAPL」「aapl/usdt」均可）；仅覆盖 Bitget 美股永续，不含加密币合约。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"sort": map[string]any{
+						"type":        "string",
+						"description": "排序方式：percent=按24h涨跌幅（默认），amount=按24h成交额，funding=按当期资金费率绝对值。",
+					},
+					"limit": map[string]any{
+						"type":        "number",
+						"description": "返回条数，默认 20，最大 100。",
+					},
+					"symbols": map[string]any{
+						"type":        "string",
+						"description": "可选，指定合约并忽略排序，如 aapl,tsla,nvda 或 bt:aaplusdt，英文逗号分隔。",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetBitgetFuturesKLine",
+			Description: "获取 Bitget 美股永续合约 K 线数据。注意：Bitget K 线以 UTC 为界（日K 为 UTC 00:00），与 A股/港股交易日不同。symbol 支持中文别名，如「苹果」「AAPL」。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"symbol": map[string]any{
+						"type":        "string",
+						"description": "合约标识，如 aapl、苹果、aapl/usdt、AAPLUSDT、bt:aaplusdt。",
+					},
+					"interval": map[string]any{
+						"type":        "string",
+						"description": "K 线周期：day/日/101=日K，week/周/102=周K，month/月/103=月K，quarter/季/104、halfYear/半年/105、year/年/106 均归为月K；分钟线：1/5/15/30/60/120/240。",
+					},
+					"limit": map[string]any{
+						"type":        "number",
+						"description": "K 线根数，默认 90，最大 1000。",
+					},
+				},
+				Required: []string{"symbol"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "GetBitgetFuturesDerivatives",
+			Description: "获取 Bitget 美股永续合约的衍生指标：资金费率（当期/近期均值/年化）、标记价与指数价（基差）、当前未平仓量 OI。" +
+				"注意：Bitget 美股永续**不提供多空持仓比**，也**无 OI 历史序列**，故只能得到当前值。symbol 支持中文别名。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"symbol": map[string]any{
+						"type":        "string",
+						"description": "合约标识，如 aapl、苹果、aapl/usdt、AAPLUSDT、bt:aaplusdt。",
+					},
+				},
+				Required: []string{"symbol"},
+			},
+		},
+	})
+
+	// OKX（欧易）交易：账户/持仓/订单查询 + 下单/撤单（需在设置页配置 API 凭证并开启交易开关）
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "GetOKXAccount",
+			Description: "查询用户 OKX（欧易）账户余额：总权益（USD）、各币种权益/可用/冻结与持仓模式。" +
+				"用 env 参数选择账户环境：sim=模拟盘（默认），live=实盘（真实资金）。模拟盘与实盘是两套独立密钥与独立账户。" +
+				"需先在设置页配置对应环境的 OKX API 凭证。当用户问「我的 OKX 余额/账户/资产/权益」时使用。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"env": map[string]any{
+						"type":        "string",
+						"enum":        []string{"sim", "live"},
+						"description": "账户环境：sim=模拟盘（默认），live=实盘（真实资金，只读查询不产生交易）。",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "GetOKXPositions",
+			Description: "查询用户 OKX（欧易）当前持仓：品种、方向（多/空）、数量（SWAP 以张计）、开仓均价、标记价、" +
+				"未实现盈亏、收益率、杠杆、保证金模式与预估强平价。用 env 参数选择账户环境：sim=模拟盘（默认），live=实盘（真实资金）。" +
+				"两环境账户独立、持仓互不可见。当用户问「我的 OKX 持仓/仓位/浮盈浮亏」时使用。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"instId": map[string]any{
+						"type":        "string",
+						"description": "可选，品种标识（如 btc、BTC-USDT-SWAP、BTC-USDT），为空查全部持仓。",
+					},
+					"env": map[string]any{
+						"type":        "string",
+						"enum":        []string{"sim", "live"},
+						"description": "账户环境：sim=模拟盘（默认），live=实盘（真实资金，只读查询不产生交易）。",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "GetOKXOrders",
+			Description: "查询用户 OKX（欧易）订单：待成交委托或历史订单（含成交均价、成交量、状态）。" +
+				"用 env 参数选择账户环境：sim=模拟盘（默认），live=实盘（真实资金），两环境订单互不可见。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"status": map[string]any{
+						"type":        "string",
+						"description": "pending=待成交（默认），history=历史订单（含已成交/已撤销）。",
+					},
+					"instType": map[string]any{
+						"type":        "string",
+						"description": "可选，SPOT=币币现货，SWAP=永续合约（默认），不传查两类。",
+					},
+					"instId": map[string]any{
+						"type":        "string",
+						"description": "可选，品种标识（如 btc、BTC-USDT-SWAP），为空查全部。",
+					},
+					"limit": map[string]any{
+						"type":        "number",
+						"description": "返回条数，默认 20，最大 100。",
+					},
+					"env": map[string]any{
+						"type":        "string",
+						"enum":        []string{"sim", "live"},
+						"description": "账户环境：sim=模拟盘（默认），live=实盘（真实资金，只读查询不产生交易）。",
+					},
+				},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "PlaceOKXOrder",
+			Description: "在用户 OKX（欧易）账户下单，交易环境由 env 参数显式指定：sim=模拟盘（默认，不动真实资金），" +
+				"live=实盘（真实资金！下单前必须与用户二次确认）。支持 SPOT 现货与 SWAP 永续、限价/市价、附带止损止盈。" +
+				"注意：SWAP 数量单位是「张」（一张=ctVal 个币），SPOT 数量单位是基础币数量；" +
+				"下单前应与用户确认品种/方向/数量/价格/环境，并先查余额或行情辅助决策。需在设置页开启「OKX 交易」开关。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"instId": map[string]any{
+						"type":        "string",
+						"description": "品种标识，如 btc、BTC-USDT-SWAP（永续）、BTC-USDT（现货）。",
+					},
+					"env": map[string]any{
+						"type":        "string",
+						"enum":        []string{"sim", "live"},
+						"description": "交易环境：sim=模拟盘（默认），live=实盘（真实资金，谨慎！下单前必须与用户确认）。",
+					},
+					"instType": map[string]any{
+						"type":        "string",
+						"description": "可选，SPOT 或 SWAP；不传时按标识自动判断（默认 SWAP）。",
+					},
+					"side": map[string]any{
+						"type":        "string",
+						"description": "buy=买入/开多，sell=卖出/开空。",
+					},
+					"sz": map[string]any{
+						"type":        "string",
+						"description": "下单数量：SWAP 为张数（如 1），SPOT 为基础币数量（如 0.01）。",
+					},
+					"ordType": map[string]any{
+						"type":        "string",
+						"description": "limit=限价（默认，需传 px），market=市价。",
+					},
+					"px": map[string]any{
+						"type":        "string",
+						"description": "限价单价格；市价单不传。",
+					},
+					"tdMode": map[string]any{
+						"type":        "string",
+						"description": "可选保证金模式：cash=现货（默认），cross=全仓（SWAP 默认），isolated=逐仓。",
+					},
+					"posSide": map[string]any{
+						"type":        "string",
+						"description": "可选持仓方向：net（默认，单向持仓），long/short（双向持仓模式必须传）。",
+					},
+					"reduceOnly": map[string]any{
+						"type":        "string",
+						"description": "可选，true=只减仓（平仓不反向开新仓）。",
+					},
+					"slTriggerPx": map[string]any{
+						"type":        "string",
+						"description": "可选，止损触发价（市价止损）。",
+					},
+					"tpTriggerPx": map[string]any{
+						"type":        "string",
+						"description": "可选，止盈触发价（市价止盈）。",
+					},
+				},
+				Required: []string{"instId", "side", "sz"},
+			},
+		},
+	})
+
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "CancelOKXOrder",
+			Description: "撤销用户 OKX（欧易）账户的待成交订单，用 env 参数选择环境：sim=模拟盘（默认），live=实盘（真实资金）。" +
+				"两环境订单互不可见，撤单必须用下单时相同的环境。需提供品种与订单号（可先调用 GetOKXOrders status=pending 获取）。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"instId": map[string]any{
+						"type":        "string",
+						"description": "品种标识，如 BTC-USDT-SWAP。",
+					},
+					"ordId": map[string]any{
+						"type":        "string",
+						"description": "订单号（GetOKXOrders 返回的订单号字段）。",
+					},
+					"env": map[string]any{
+						"type":        "string",
+						"enum":        []string{"sim", "live"},
+						"description": "交易环境：sim=模拟盘（默认），live=实盘（真实资金）。须与下单时的环境一致。",
+					},
+				},
+				Required: []string{"instId", "ordId"},
+			},
+		},
+	})
+
 	tools = appendAgentParityTools(tools)
 
+	// 根据 API Key 配置过滤工具，未配置对应 Key 的工具不注册
+	tools = FilterToolsByApiKey(tools)
+
+	// 定制版本（-tags custom）不包含 OKX/合约相关功能：过滤币安/Bitget 合约与 OKX 交易工具
+	tools = filterToolsForCustomBuild(tools)
+
 	return tools
+}
+
+// customBuildExcludedTools 定制版本（-tags custom）从 AI 工具注册表中排除的
+// OKX/合约相关工具（功能与设置均不包含；handler 注册保留但永远不会被调用）。
+var customBuildExcludedTools = map[string]bool{
+	"GetBinanceFuturesMarket":      true,
+	"GetBinanceFuturesKLine":       true,
+	"GetBinanceFuturesDerivatives": true,
+	"GetBitgetFuturesMarket":       true,
+	"GetBitgetFuturesKLine":        true,
+	"GetBitgetFuturesDerivatives":  true,
+	"GetOKXAccount":                true,
+	"GetOKXPositions":              true,
+	"GetOKXOrders":                 true,
+	"PlaceOKXOrder":                true,
+	"CancelOKXOrder":               true,
+}
+
+// filterToolsForCustomBuild 非定制版本原样返回；定制版本剔除 OKX/合约相关工具。
+func filterToolsForCustomBuild(tools []Tool) []Tool {
+	if !CustomBuild {
+		return tools
+	}
+	filtered := make([]Tool, 0, len(tools))
+	for _, t := range tools {
+		if customBuildExcludedTools[t.Function.Name] {
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	return filtered
 }
 
 type dataToolGroup string
@@ -2215,6 +3614,7 @@ var dataToolGroupMap = map[string]dataToolGroup{
 	"IsTradingDay":       dataToolGroupBase,
 	"GetNextTradingDay":  dataToolGroupBase,
 	"GetFollowedStocks":  dataToolGroupBase,
+	"CleanupStockCodes":  dataToolGroupBase,
 
 	"GetStockInfo":                dataToolGroupStockAnalysis,
 	"GetStockKLine":               dataToolGroupStockAnalysis,
@@ -2230,7 +3630,9 @@ var dataToolGroupMap = map[string]dataToolGroup{
 	"GetTdxFinanceInfo":           dataToolGroupStockAnalysis,
 	"GetTdxXDXRInfo":              dataToolGroupStockAnalysis,
 	"GetTdxCompanyCategory":       dataToolGroupStockAnalysis,
+	"GetTdxSymbolBelongBoard":     dataToolGroupStockAnalysis,
 	"GetStockLatestFinance":       dataToolGroupStockAnalysis,
+	"GetHKStockLatestFinance":     dataToolGroupStockAnalysis,
 	"GetStockQtrMainFinance":      dataToolGroupStockAnalysis,
 	"GetStockOrgPredict":          dataToolGroupStockAnalysis,
 	"GetStockPredictSummary":      dataToolGroupStockAnalysis,
@@ -2240,11 +3642,13 @@ var dataToolGroupMap = map[string]dataToolGroup{
 	"GetStockHolderTrend":         dataToolGroupStockAnalysis,
 	"GetStockBillboard":           dataToolGroupStockAnalysis,
 	"GetStockOperationDeptTrade":  dataToolGroupStockAnalysis,
+	"GetLhbSeatDetail":            dataToolGroupStockAnalysis,
+	"GetBkFundFlowRank":           dataToolGroupMoneyFlow,
+	"GetBkConstituentStocks":      dataToolGroupMoneyFlow,
 	"ComparableCompanyAnalysis":   dataToolGroupStockAnalysis,
 	"FinancialQA":                 dataToolGroupStockAnalysis,
 	"GetAIAnalysisContent":        dataToolGroupStockAnalysis,
 	"GetStockResearchReport":      dataToolGroupStockAnalysis,
-	"GetIndustryResearchReport":   dataToolGroupStockAnalysis,
 	"InteractiveAnswer":           dataToolGroupStockAnalysis,
 	"GetSecuritiesCompanyOpinion": dataToolGroupStockAnalysis,
 	"StockNotice":                 dataToolGroupStockAnalysis,
@@ -2302,6 +3706,26 @@ var dataToolGroupMap = map[string]dataToolGroup{
 	"GetMutualTop10Deal":       dataToolGroupMoneyFlow,
 	"GetStockHistoryMoneyData": dataToolGroupMoneyFlow,
 	"GetIndustryMoneyRank":     dataToolGroupMoneyFlow,
+	"GetMACCapitalFlow":        dataToolGroupMoneyFlow,
+	"GetFuturesPosition":       dataToolGroupMoneyFlow,
+	"GetTdxTickData":           dataToolGroupMoneyFlow,
+
+	// 通达信 ICFQS 龙虎榜/游资
+	"GetStockLHBDetail":      dataToolGroupNewsResearch,
+	"GetYYBLHBDetail":        dataToolGroupNewsResearch,
+	"GetActiveCapitalDetail": dataToolGroupNewsResearch,
+
+	// 通达信 ICFQS 主题投资与 MAC 盘口/异动
+	"GetTopicRotation":    dataToolGroupMarket,
+	"GetHotTopics":        dataToolGroupMarket,
+	"GetTopTopics":        dataToolGroupMarket,
+	"GetTopicStocks":      dataToolGroupMarket,
+	"GetTopicKLine":       dataToolGroupMarket,
+	"GetMACBoardList":     dataToolGroupMarket,
+	"GetMACBoardMembers":  dataToolGroupMarket,
+	"GetMACMarketMonitor": dataToolGroupMarket,
+	"GetMACSymbolInfo":    dataToolGroupMarket,
+	"GetTdxMinuteTrend":   dataToolGroupMarket,
 
 	"GetNewsListData":          dataToolGroupNewsResearch,
 	"QueryStockNews":           dataToolGroupNewsResearch,
@@ -2326,15 +3750,49 @@ var dataToolGroupMap = map[string]dataToolGroup{
 	"GetAIAnalysisHistory":         dataToolGroupAIAnalysis,
 	"GetAIAnalysisDetail":          dataToolGroupAIAnalysis,
 
-	"SetTradingPrice":     dataToolGroupOperations,
-	"SendDingDingMessage": dataToolGroupOperations,
-	"SendToDingDing":      dataToolGroupOperations,
-	"SearchFund":              dataToolGroupOperations,
-	"GetFundInfo":             dataToolGroupOperations,
-	"GetFundKLine":            dataToolGroupOperations,
-	"GetFundHistoryNetValue":  dataToolGroupOperations,
-	"GetFundTop10Holdings":    dataToolGroupOperations,
-	"GetEconomicData":     dataToolGroupOperations,
+	"SetTradingPrice":                dataToolGroupOperations,
+	"FollowStock":                    dataToolGroupOperations,
+	"AddDailyOperationPlan":          dataToolGroupOperations,
+	"GetDailyOperationPlanList":      dataToolGroupOperations,
+	"UpdateDailyOperationPlan":       dataToolGroupOperations,
+	"UpdateDailyOperationPlanStatus": dataToolGroupOperations,
+	"SendDingDingMessage":            dataToolGroupOperations,
+	"SendToDingDing":                 dataToolGroupOperations,
+	"SendFeishuMessage":              dataToolGroupOperations,
+	"SendToFeishu":                   dataToolGroupOperations,
+	"SearchFund":                     dataToolGroupOperations,
+	"GetFundInfo":                    dataToolGroupOperations,
+	"GetFundKLine":                   dataToolGroupOperations,
+	"GetFundHistoryNetValue":         dataToolGroupOperations,
+	"GetFundTop10Holdings":           dataToolGroupOperations,
+	"GetEconomicData":                dataToolGroupOperations,
+	"GetTradingRecordList":           dataToolGroupOperations,
+	"GetTradingRecordStatistics":     dataToolGroupOperations,
+
+	// 分组与概念标签管理（16 个工具）
+	"GetStockGroups":          dataToolGroupOperations,
+	"CreateStockGroup":        dataToolGroupOperations,
+	"UpdateStockGroup":        dataToolGroupOperations,
+	"DeleteStockGroup":        dataToolGroupOperations,
+	"AddStockToGroup":         dataToolGroupOperations,
+	"RemoveStockFromGroup":    dataToolGroupOperations,
+	"BatchMoveStocksToGroup":  dataToolGroupOperations,
+	"GetStockConcepts":        dataToolGroupOperations,
+	"CreateStockConcept":      dataToolGroupOperations,
+	"UpdateStockConcept":      dataToolGroupOperations,
+	"DeleteStockConcept":      dataToolGroupOperations,
+	"AddStockToConcept":       dataToolGroupOperations,
+	"RemoveStockFromConcept":  dataToolGroupOperations,
+	"BatchAddStocksToConcept": dataToolGroupOperations,
+	"MergeStockConcepts":      dataToolGroupOperations,
+	"ReorganizeStockGroups":   dataToolGroupOperations,
+
+	"MarkdownToImage": dataToolGroupOperations,
+
+	"ListPromptTemplates":  dataToolGroupBase,
+	"GetPromptTemplate":    dataToolGroupBase,
+	"SavePromptTemplate":   dataToolGroupBase,
+	"DeletePromptTemplate": dataToolGroupBase,
 }
 
 type dataToolGroupKeywords struct {
@@ -2368,6 +3826,7 @@ var dataToolGroupKeywordsList = []dataToolGroupKeywords{
 	{dataToolGroupMoneyFlow, []string{
 		"资金", "流入", "流出", "净流入", "净流出", "北向", "南向", "沪股通", "深股通",
 		"港股通", "主力", "外资", "行业资金", "板块资金",
+		"期指", "股指期货", "多空单", "多空", "净持仓", "空头", "多头持仓",
 	}},
 	{dataToolGroupNewsResearch, []string{
 		"新闻", "资讯", "消息", "公告", "最新动态", "政策", "券商", "机构观点", "评级",
@@ -2382,6 +3841,10 @@ var dataToolGroupKeywordsList = []dataToolGroupKeywords{
 	{dataToolGroupOperations, []string{
 		"预警", "价位", "开仓", "成本价", "钉钉", "QQ", "通知", "推送", "发送消息",
 		"基金", "基金代码", "基金名称", "净值",
+		"关注", "自选", "加自选", "加入分组", "设置概念", "概念标签", "归类", "持仓", "持仓量",
+		"交易日志", "交易记录", "盈亏",
+		"操作计划", "每日计划", "操作方案", "明日操作", "明天操作", "盘中预警",
+		"生成图片", "转成图片", "转为图片", "导出图片", "保存为图片", "图片形式", "长图", "渲染图片",
 	}},
 }
 
@@ -2429,6 +3892,7 @@ func appendAgentParityTools(tools []Tool) []Tool {
 		description string
 	}{
 		{"SendDingDingMessage", "将指定标题和内容以 Markdown 形式发送到钉钉机器人。等同于 SendToDingDing。"},
+		{"SendFeishuMessage", "将指定标题和内容以 Markdown 卡片形式发送到飞书机器人。等同于 SendToFeishu。"},
 	} {
 		tools = append(tools, Tool{
 			Type: "function",
@@ -2584,6 +4048,434 @@ func appendAgentParityTools(tools []Tool) []Tool {
 					},
 				},
 				Required: []string{"plate_name"},
+			},
+		},
+	})
+
+	// === 分组与概念标签管理（16 个工具）===
+	// 1. GetStockGroups
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetStockGroups",
+			Description: "获取所有股票分组列表，以及每个分组下的股票代码。可用于查看分组结构、确认分组ID。",
+			Parameters: &FunctionParameters{
+				Type:       "object",
+				Properties: map[string]any{},
+			},
+		},
+	})
+	// 2. CreateStockGroup
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "CreateStockGroup",
+			Description: "创建股票分组（按名称查找/创建，已存在则幂等返回）。返回分组ID。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"groupName": map[string]any{
+						"type":        "string",
+						"description": "分组名称",
+					},
+				},
+				Required: []string{"groupName"},
+			},
+		},
+	})
+	// 3. UpdateStockGroup
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "UpdateStockGroup",
+			Description: "重命名股票分组。需先获取分组ID（可用 GetStockGroups 查询）。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"groupId": map[string]any{
+						"type":        "integer",
+						"description": "分组ID",
+					},
+					"groupName": map[string]any{
+						"type":        "string",
+						"description": "新的分组名称",
+					},
+				},
+				Required: []string{"groupId", "groupName"},
+			},
+		},
+	})
+	// 4. DeleteStockGroup
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "DeleteStockGroup",
+			Description: "删除股票分组，级联删除该分组下的股票归属关系（不会取消关注股票本身）。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"groupId": map[string]any{
+						"type":        "integer",
+						"description": "分组ID",
+					},
+				},
+				Required: []string{"groupId"},
+			},
+		},
+	})
+	// 5. AddStockToGroup
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "AddStockToGroup",
+			Description: "将一只股票加入指定分组（按分组名查找/创建，幂等）。仅建立归属关系，不会触发关注动作。" +
+				"美股代码 us 前缀会被自动归一化。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码，如 000001.SZ、sh600519、00700.HK、usaapl。",
+					},
+					"groupName": map[string]any{
+						"type":        "string",
+						"description": "分组名称，不存在则自动创建。",
+					},
+				},
+				Required: []string{"stockCode", "groupName"},
+			},
+		},
+	})
+	// 6. RemoveStockFromGroup
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "RemoveStockFromGroup",
+			Description: "将一只股票从指定分组中移出（仅解除归属，不会取消关注）。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码",
+					},
+					"groupName": map[string]any{
+						"type":        "string",
+						"description": "分组名称",
+					},
+				},
+				Required: []string{"stockCode", "groupName"},
+			},
+		},
+	})
+	// 7. BatchMoveStocksToGroup
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "BatchMoveStocksToGroup",
+			Description: "批量将多只股票加入同一分组（按分组名查找/创建，幂等）。美股代码 us 前缀自动归一化。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCodes": map[string]any{
+						"type":        "array",
+						"description": "股票代码列表",
+						"items": map[string]any{
+							"type": "string",
+						},
+					},
+					"groupName": map[string]any{
+						"type":        "string",
+						"description": "分组名称，不存在则自动创建",
+					},
+				},
+				Required: []string{"stockCodes", "groupName"},
+			},
+		},
+	})
+	// 8. GetStockConcepts
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetStockConcepts",
+			Description: "获取概念标签列表。可选传入 stockCode 只查该股票的概念；不传则返回全部概念-股票归属。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "可选，股票代码，传入则只返回该股票的概念标签",
+					},
+				},
+			},
+		},
+	})
+	// 9. CreateStockConcept
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "CreateStockConcept",
+			Description: "创建概念标签（按名称查找/去重创建，已存在则幂等返回）。返回概念ID。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"conceptName": map[string]any{
+						"type":        "string",
+						"description": "概念名称",
+					},
+				},
+				Required: []string{"conceptName"},
+			},
+		},
+	})
+	// 10. UpdateStockConcept
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "UpdateStockConcept",
+			Description: "重命名概念标签。重名（忽略大小写）会被拒绝。需先获取概念ID（可用 GetStockConcepts 查询）。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"conceptId": map[string]any{
+						"type":        "integer",
+						"description": "概念ID",
+					},
+					"conceptName": map[string]any{
+						"type":        "string",
+						"description": "新的概念名称",
+					},
+				},
+				Required: []string{"conceptId", "conceptName"},
+			},
+		},
+	})
+	// 11. DeleteStockConcept
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "DeleteStockConcept",
+			Description: "删除概念标签，级联删除该概念下的所有股票归属关系。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"conceptId": map[string]any{
+						"type":        "integer",
+						"description": "概念ID",
+					},
+				},
+				Required: []string{"conceptId"},
+			},
+		},
+	})
+	// 12. AddStockToConcept
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "AddStockToConcept",
+			Description: "为一只股票打上概念标签（按概念名查找/去重创建，幂等）。不会触发关注动作。" +
+				"美股代码 us 前缀会被自动归一化。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码",
+					},
+					"conceptName": map[string]any{
+						"type":        "string",
+						"description": "概念名称，不存在则自动去重创建",
+					},
+				},
+				Required: []string{"stockCode", "conceptName"},
+			},
+		},
+	})
+	// 13. RemoveStockFromConcept
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "RemoveStockFromConcept",
+			Description: "移除一只股票的概念标签。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCode": map[string]any{
+						"type":        "string",
+						"description": "股票代码",
+					},
+					"conceptName": map[string]any{
+						"type":        "string",
+						"description": "概念名称",
+					},
+				},
+				Required: []string{"stockCode", "conceptName"},
+			},
+		},
+	})
+	// 14. BatchAddStocksToConcept
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "BatchAddStocksToConcept",
+			Description: "批量为多只股票打上同一概念标签（按概念名查找/去重创建，幂等）。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"stockCodes": map[string]any{
+						"type":        "array",
+						"description": "股票代码列表",
+						"items": map[string]any{
+							"type": "string",
+						},
+					},
+					"conceptName": map[string]any{
+						"type":        "string",
+						"description": "概念名称，不存在则自动去重创建",
+					},
+				},
+				Required: []string{"stockCodes", "conceptName"},
+			},
+		},
+	})
+	// 15. MergeStockConcepts
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "MergeStockConcepts",
+			Description: "合并概念标签：将源概念下的所有股票转移到目标概念（目标不存在则创建），然后删除源概念。用于整理重复/相似的概念。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"sourceConceptName": map[string]any{
+						"type":        "string",
+						"description": "源概念名称（将被删除）",
+					},
+					"targetConceptName": map[string]any{
+						"type":        "string",
+						"description": "目标概念名称（将保留并接收所有股票）",
+					},
+				},
+				Required: []string{"sourceConceptName", "targetConceptName"},
+			},
+		},
+	})
+	// 16. ReorganizeStockGroups
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "ReorganizeStockGroups",
+			Description: "批量重新整理多只股票的分组归属（一次操作多只股票、多个分组）。可选先清除各股票的现有分组归属再加入新分组。" +
+				"assignments 每项为 {stockCode, groupName}。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"assignments": map[string]any{
+						"type":        "array",
+						"description": "归属分配列表，每项含 stockCode 和 groupName",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"stockCode": map[string]any{"type": "string", "description": "股票代码"},
+								"groupName": map[string]any{"type": "string", "description": "目标分组名称"},
+							},
+						},
+					},
+					"clearExisting": map[string]any{
+						"type":        "boolean",
+						"description": "可选，是否先清除各股票现有的全部分组归属，默认 false",
+					},
+				},
+				Required: []string{"assignments"},
+			},
+		},
+	})
+
+	// 提示词模板管理（4 个工具）
+	// 1. ListPromptTemplates
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "ListPromptTemplates",
+			Description: "查询提示词模板列表。可按名称关键词模糊搜索（如传\"龙头\"可命中\"龙头战法复盘\"）、按类型筛选，为空则返回全部。返回摘要列表（content 截断为 200 字预览）。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "可选，按模板名称关键词模糊筛选（支持部分匹配）",
+					},
+					"type": map[string]any{
+						"type":        "string",
+						"description": "可选，按模板类型筛选（如 system/user）",
+					},
+				},
+			},
+		},
+	})
+	// 2. GetPromptTemplate
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "GetPromptTemplate",
+			Description: "按 ID 获取单个提示词模板的完整内容。当需要查看模板全文时使用。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"id": map[string]any{
+						"type":        "integer",
+						"description": "模板 ID",
+					},
+				},
+				Required: []string{"id"},
+			},
+		},
+	})
+	// 3. SavePromptTemplate
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "SavePromptTemplate",
+			Description: "创建或更新提示词模板。id > 0 时为更新已有模板，否则为新建。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"id": map[string]any{
+						"type":        "integer",
+						"description": "可选，模板 ID。提供时为更新，不提供时为新建",
+					},
+					"name": map[string]any{
+						"type":        "string",
+						"description": "模板名称",
+					},
+					"content": map[string]any{
+						"type":        "string",
+						"description": "模板内容",
+					},
+					"type": map[string]any{
+						"type":        "string",
+						"description": "可选，模板类型（如 system/user）",
+					},
+				},
+				Required: []string{"name", "content"},
+			},
+		},
+	})
+	// 4. DeletePromptTemplate
+	tools = append(tools, Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "DeletePromptTemplate",
+			Description: "按 ID 删除提示词模板。",
+			Parameters: &FunctionParameters{
+				Type: "object",
+				Properties: map[string]any{
+					"id": map[string]any{
+						"type":        "integer",
+						"description": "模板 ID",
+					},
+				},
+				Required: []string{"id"},
 			},
 		},
 	})

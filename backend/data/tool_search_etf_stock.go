@@ -151,6 +151,13 @@ func handleCreateAiRecommendStocks(o *OpenAi, funcArguments string, ctx *ToolCon
 		return err
 	}
 
+	// 用实际使用的模型名覆盖 AI 自填值，并关联系统/用户提示词
+	recommend.ModelName = ctx.Model
+	recommend.ConfigName = o.ConfigName
+	recommend.SystemPrompt = ctx.SystemPrompt
+	recommend.UserPrompt = ctx.Question
+	recommend.PromptHash = ShortPromptHash(ctx.SystemPrompt)
+
 	svcErr := NewAiRecommendStocksService().CreateAiRecommendStocks(&recommend)
 
 	appendToolMessages(
@@ -193,6 +200,18 @@ func handleBatchCreateAiRecommendStocks(o *OpenAi, funcArguments string, ctx *To
 	if err := json.Unmarshal([]byte(stocks), &recommends); err != nil {
 		//logger.SugaredLogger.Infof("BatchCreateAiRecommendStocks error : %s", err.Error())
 		return err
+	}
+
+	// 用实际使用的模型名覆盖 AI 自填值，并关联系统/用户提示词
+	for _, r := range recommends {
+		if r == nil {
+			continue
+		}
+		r.ModelName = ctx.Model
+		r.ConfigName = o.ConfigName
+		r.SystemPrompt = ctx.SystemPrompt
+		r.UserPrompt = ctx.Question
+		r.PromptHash = ShortPromptHash(ctx.SystemPrompt)
 	}
 
 	svcErr := NewAiRecommendStocksService().BatchCreateAiRecommendStocks(recommends)

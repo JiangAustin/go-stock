@@ -559,17 +559,88 @@ type KLineSourceResult struct {
 	Source string       `json:"source"`
 }
 
-func FetchKLineWithFallback(stockCode, stockName, klt string, limit int, end string) *KLineSourceResult {
-	eastMoneyResult := fetchFromEastMoney(stockCode, stockName, klt, limit, end)
+// eastMoneyAdjustFromFlag 将前端复权标识转为东方财富 API 的 fqt 参数值。
+// "qfq"→"1"(前复权)、"hfq"→"2"(后复权)、"none"/"0"→"0"(不复权)；
+// 空串或无法识别时返回空串，保留 EastMoney API 默认行为（兼容旧调用方）。
+func eastMoneyAdjustFromFlag(adjustFlag string) string {
+	switch strings.ToLower(strings.TrimSpace(adjustFlag)) {
+	case "qfq":
+		return "1"
+	case "hfq":
+		return "2"
+	case "none", "0":
+		return "0"
+	default:
+		return ""
+	}
+}
+
+// FetchKLineWithFallback 按降级链获取 K 线数据：MAC→东方财富→(港美股返回)→新浪→腾讯→通达信。
+// adjustFlag 可选，控制复权类型："qfq"前复权、"hfq"后复权、"none"/"0"不复权；
+// 未传时各数据源保持原有默认行为（A股 MAC/通达信默认前复权，港股默认不复权，EastMoney 走 API 默认）。
+// 注意：新浪/腾讯数据源硬编码前复权作为兜底，adjustFlag 对其无效；港美股 ExKLine2 协议不支持复权。
+func FetchKLineWithFallback(stockCode, stockName, klt string, limit int, end string, adjustFlag ...string) *KLineSourceResult {
+	flag := adjustFlagFromVariadic(adjustFlag...)
+	end = strings.TrimSpace(end)
+	// 分页标记：end 非空表示图表向左拖动「取更早历史」。
+	// MAC 通过 GetMACKLineDataBefore 深取后按 end 过滤，具备日期分页能力；
+	// 新浪/腾讯/通达信不支持 end（会原样返回最新一段，合并后 added=0），分页请求不走它们。
+	paged := end != ""
+
+	// 币安 USDT-M 永续合约：独立行情体系，不走 A股/港美股降级链
+	if IsBinanceFuturesCode(stockCode) {
+		return fetchFromBinanceFutures(stockCode, klt, limit, end)
+	}
+
+	// Bitget 美股永续合约：独立行情体系，不走 A股/港美股降级链
+	if IsBitgetFuturesCode(stockCode) {
+		return fetchFromBitgetFutures(stockCode, klt, limit, end)
+	}
+
+	// OKX 合约（ok: 前缀，含币安/Bitget 没有的品种）：独立行情体系，走 OKX 公共 K 线接口
+	if IsOKXCode(stockCode) {
+		return fetchFromOKX(stockCode, klt, limit, end)
+	}
+
+	// MAC 为主力源：首屏与分页都先走它（分页由 GetMACKLineDataBefore 按日期过滤出更早一段）
+	macResult := fetchFromMACWithTimeout(stockCode, klt, limit, end, 5*time.Second, flag)
+	if macResult != nil && macResult.Data != nil && len(*macResult.Data) > 0 {
+		macResult.Source = "tdx-mac"
+		fillVolumeRatio(macResult.Data)
+		return macResult
+	}
+	if !paged {
+		logger.SugaredLogger.Warnf("MAC K线数据为空或超时，尝试东方财富数据源: code=%s klt=%s", stockCode, klt)
+	}
+
+	eastMoneyResult := fetchFromEastMoney(stockCode, stockName, klt, limit, end, flag)
 	if eastMoneyResult != nil && eastMoneyResult.Data != nil && len(*eastMoneyResult.Data) > 0 {
 		eastMoneyResult.Source = "eastmoney"
+		fillVolumeRatio(eastMoneyResult.Data)
 		return eastMoneyResult
 	}
+
+	// 分页请求到东财为止：后续源不支持 end，返回空让前端视为「暂无更早数据」而不是误并最新段
+	if paged {
+		logger.SugaredLogger.Warnf("分页取更早K线失败（MAC/东方财富均无更早数据）: code=%s klt=%s end=%s", stockCode, klt, end)
+		return &KLineSourceResult{Data: &[]KLineData{}, Source: ""}
+	}
+
+	// 港美股/中证指数/海外指数：MAC失败后仅走东方财富，新浪/腾讯/通达信不支持港美股/.CSI/100.XXX海外指数
+	if IsHKStockCode(stockCode) || IsUSStockCode(stockCode) || IsCSIIndexCode(stockCode) || IsGlobalIndexCode(stockCode) {
+		if macResult != nil {
+			macResult.Source = "tdx-mac-ex"
+			return macResult
+		}
+		return &KLineSourceResult{Data: &[]KLineData{}, Source: ""}
+	}
+
 	logger.SugaredLogger.Warnf("EastMoney K线数据为空或失败，尝试新浪数据源: code=%s klt=%s", stockCode, klt)
 
 	sinaResult := fetchFromSina(stockCode, klt, limit)
 	if sinaResult != nil && sinaResult.Data != nil && len(*sinaResult.Data) > 0 {
 		sinaResult.Source = "sina"
+		fillVolumeRatio(sinaResult.Data)
 		return sinaResult
 	}
 	logger.SugaredLogger.Warnf("新浪K线数据也为空，尝试腾讯数据源: code=%s klt=%s", stockCode, klt)
@@ -577,13 +648,15 @@ func FetchKLineWithFallback(stockCode, stockName, klt string, limit int, end str
 	tencentResult := fetchFromTencent(stockCode, klt, limit)
 	if tencentResult != nil && tencentResult.Data != nil && len(*tencentResult.Data) > 0 {
 		tencentResult.Source = "tencent"
+		fillVolumeRatio(tencentResult.Data)
 		return tencentResult
 	}
 	logger.SugaredLogger.Warnf("腾讯K线数据也为空，尝试通达信数据源: code=%s klt=%s", stockCode, klt)
 
-	tdxResult := fetchFromTdx(stockCode, klt, limit)
+	tdxResult := fetchFromTdx(stockCode, klt, limit, flag)
 	if tdxResult != nil && tdxResult.Data != nil && len(*tdxResult.Data) > 0 {
 		tdxResult.Source = "tdx"
+		fillVolumeRatio(tdxResult.Data)
 		return tdxResult
 	}
 	logger.SugaredLogger.Warnf("通达信K线数据也为空: code=%s klt=%s", stockCode, klt)
@@ -595,13 +668,46 @@ func FetchKLineWithFallback(stockCode, stockName, klt string, limit int, end str
 	return &KLineSourceResult{Data: &[]KLineData{}, Source: ""}
 }
 
-func fetchFromEastMoney(stockCode, stockName, klt string, limit int, end string) *KLineSourceResult {
+// fillVolumeRatio 补算量比：量比 = 当日成交量 / 过去5日平均成交量
+func fillVolumeRatio(data *[]KLineData) {
+	if data == nil || len(*data) < 6 {
+		return
+	}
+	list := *data
+	for i := 5; i < len(list); i++ {
+		if list[i].VolumeRatio != "" {
+			continue
+		}
+		curVol, err := strconv.ParseFloat(list[i].Volume, 64)
+		if err != nil || curVol <= 0 {
+			continue
+		}
+		var sum float64
+		validDays := 0
+		for j := i - 5; j < i; j++ {
+			v, err := strconv.ParseFloat(list[j].Volume, 64)
+			if err == nil && v > 0 {
+				sum += v
+				validDays++
+			}
+		}
+		if validDays > 0 {
+			avg := sum / float64(validDays)
+			if avg > 0 {
+				list[i].VolumeRatio = fmt.Sprintf("%.2f", curVol/avg)
+			}
+		}
+	}
+}
+
+func fetchFromEastMoney(stockCode, stockName, klt string, limit int, end string, adjustFlag string) *KLineSourceResult {
 	api := NewEastMoneyKLineApi(GetSettingConfig())
+	emAdjust := eastMoneyAdjustFromFlag(adjustFlag)
 	var data *[]KLineData
 	if strings.TrimSpace(end) == "" {
-		data = api.GetKLineDataBefore(stockCode, klt, "", limit, "20500101")
+		data = api.GetKLineDataBefore(stockCode, klt, emAdjust, limit, "20500101")
 	} else {
-		data = api.GetKLineDataBefore(stockCode, klt, "", limit, end)
+		data = api.GetKLineDataBefore(stockCode, klt, emAdjust, limit, end)
 	}
 	return &KLineSourceResult{Data: data}
 }
@@ -618,10 +724,41 @@ func fetchFromTencent(stockCode, klt string, limit int) *KLineSourceResult {
 	return &KLineSourceResult{Data: data}
 }
 
-func fetchFromTdx(stockCode, klt string, limit int) *KLineSourceResult {
+func fetchFromTdx(stockCode, klt string, limit int, adjustFlag string) *KLineSourceResult {
 	api := NewTdxKLineApi()
-	data := api.GetKLineData(stockCode, klt, limit)
+	data := api.GetKLineData(stockCode, klt, limit, adjustFlag)
 	return &KLineSourceResult{Data: data}
+}
+
+func fetchFromMAC(stockCode, klt string, limit int, end string, adjustFlag string) *KLineSourceResult {
+	api := NewTdxKLineApi()
+	var data *[]KLineData
+	if strings.TrimSpace(end) == "" {
+		data = api.GetMACKLineData(stockCode, klt, limit, adjustFlag)
+	} else {
+		data = api.GetMACKLineDataBefore(stockCode, klt, limit, end, adjustFlag)
+	}
+	return &KLineSourceResult{Data: data}
+}
+
+func fetchFromMACWithTimeout(stockCode, klt string, limit int, end string, timeout time.Duration, adjustFlag string) *KLineSourceResult {
+	type result struct {
+		rs *KLineSourceResult
+		ok bool
+	}
+	ch := make(chan result, 1)
+	go func() {
+		rs := fetchFromMAC(stockCode, klt, limit, end, adjustFlag)
+		ch <- result{rs: rs, ok: true}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.rs
+	case <-time.After(timeout):
+		logger.SugaredLogger.Warnf("fetchFromMAC 超时 (%v)，降级到下一个数据源: code=%s klt=%s", timeout, stockCode, klt)
+		return nil
+	}
 }
 
 func AggregateSinaMonthKLine(dailyData *[]KLineData) *[]KLineData {

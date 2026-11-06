@@ -16,10 +16,12 @@ import (
 	"io"
 	"io/ioutil"
 	url2 "net/url"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/chromedp/chromedp"
@@ -29,6 +31,7 @@ import (
 	"github.com/go-resty/resty/v2"
 	"github.com/robertkrimen/otto"
 	"github.com/samber/lo"
+	"github.com/xuri/excelize/v2"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 	"gorm.io/gorm"
@@ -36,6 +39,7 @@ import (
 )
 
 const sinaStockUrl = "http://hq.sinajs.cn/rn=%d&list=%s"
+
 const txStockUrl = "http://qt.gtimg.cn/?_=%d&q=%s"
 
 const tushareApiUrl = "http://api.tushare.pro"
@@ -98,6 +102,9 @@ type StockInfo struct {
 	Sort               int64   `json:"sort"` //排序
 	AlarmChangePercent float64 `json:"alarmChangePercent"`
 	AlarmPrice         float64 `json:"alarmPrice"`
+
+	// 量比：仅沪深A股有值（腾讯行情直接提供），港股/美股/北交所为空
+	VolumeRatio string `json:"量比" gorm:"-"`
 
 	Groups []GroupStock `gorm:"-:all"`
 }
@@ -248,6 +255,13 @@ type TradingRecordStatistics struct {
 	HoldingsAmount  float64 `json:"holdingsAmount"`
 	CurrentValue    float64 `json:"currentValue"`
 	StockCount      int64   `json:"stockCount"`
+	// 当日交易盈亏与收益（基于今日交易记录计算）
+	TodayBuyAmount      float64 `json:"todayBuyAmount"`      // 今日买入总额
+	TodaySellAmount     float64 `json:"todaySellAmount"`     // 今日卖出总额
+	TodayRealizedProfit float64 `json:"todayRealizedProfit"` // 今日已实现盈亏（卖出）
+	TodayFloatingProfit float64 `json:"todayFloatingProfit"` // 今日浮动盈亏（今日买入按现价计算）
+	TodayProfit         float64 `json:"todayProfit"`         // 今日总盈亏 = 已实现 + 浮动
+	TodayProfitRate     float64 `json:"todayProfitRate"`     // 今日收益率
 }
 
 type TushareStockBasicResponse struct {
@@ -370,6 +384,47 @@ func (receiver StockDataApi) GetStockCodeRealTimeData(StockCodes ...string) (*[]
 
 	stockInfos := make([]StockInfo, 0)
 
+	// 币安 USDT-M 永续合约：独立数据源，不参与腾讯/新浪行情批取
+	restCodes := make([]string, 0, len(StockCodes))
+	for _, code := range StockCodes {
+		if IsBinanceFuturesCode(code) {
+			if info := BinanceRealtimeStockInfo(code); info != nil {
+				stockInfos = append(stockInfos, *info)
+				go func(si StockInfo) {
+					var count int64
+					db.Dao.Model(&StockInfo{}).Where("code = ?", si.Code).Count(&count)
+					if count == 0 {
+						db.Dao.Model(&StockInfo{}).Create(&si)
+					} else {
+						db.Dao.Model(&StockInfo{}).Where("code = ?", si.Code).Updates(&si)
+					}
+				}(*info)
+			}
+			continue
+		}
+		// Bitget 美股永续合约：独立数据源，同样不参与腾讯/新浪行情批取
+		if IsBitgetFuturesCode(code) {
+			if info := BitgetRealtimeStockInfo(code); info != nil {
+				stockInfos = append(stockInfos, *info)
+				go func(si StockInfo) {
+					var count int64
+					db.Dao.Model(&StockInfo{}).Where("code = ?", si.Code).Count(&count)
+					if count == 0 {
+						db.Dao.Model(&StockInfo{}).Create(&si)
+					} else {
+						db.Dao.Model(&StockInfo{}).Where("code = ?", si.Code).Updates(&si)
+					}
+				}(*info)
+			}
+			continue
+		}
+		restCodes = append(restCodes, code)
+	}
+	StockCodes = restCodes
+	if len(StockCodes) == 0 {
+		return &stockInfos, nil
+	}
+
 	hkcodes := slice.Filter(StockCodes, func(i int, s string) bool {
 		return strutil.HasPrefixAny(s, []string{"hk", "HK", "sh", "sz"})
 	})
@@ -491,11 +546,12 @@ func (receiver StockDataApi) Follow(stockCode string) string {
 	count := int64(0)
 	db.Dao.Model(&FollowedStock{}).Where("is_del = ?", 0).Count(&count)
 	//logger.SugaredLogger.Errorf("Follow-count %v", count)
-	if count >= 63 {
-		return "最多只能关注63只股票"
+	// VIP 用户（有效期内）不限制关注数量，非 VIP 用户最多关注 63 只
+	if _, active := EffectiveSponsorVipLevel(); !active && count >= 63 {
+		return "最多只能关注63只股票，升级VIP后不限数量"
 	}
 
-	stockCode = strings.ToLower(stockCode)
+	stockCode = normalizeStockCode(stockCode)
 
 	// 检查是否已经关注过该股票
 	var existingStock FollowedStock
@@ -532,7 +588,7 @@ func (receiver StockDataApi) UnFollow(stockCode string) string {
 		stockCode = strings.Replace(stockCode, "gb_", "us", 1)
 		stockCode = strings.Replace(stockCode, "GB_", "us", 1)
 	}
-	db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", strings.ToLower(stockCode)).Delete(&FollowedStock{})
+	db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", normalizeStockCode(stockCode)).Delete(&FollowedStock{})
 	return "取消关注成功"
 }
 
@@ -542,7 +598,7 @@ func (receiver StockDataApi) SetCostPriceAndVolume(price float64, volume int64, 
 		stockCode = strings.Replace(stockCode, "gb_", "us", 1)
 		stockCode = strings.Replace(stockCode, "GB_", "us", 1)
 	}
-	err := db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", strings.ToLower(stockCode)).Update("cost_price", price).Update("volume", volume).Error
+	err := db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", normalizeStockCode(stockCode)).Update("cost_price", price).Update("volume", volume).Error
 	if err != nil {
 		logger.SugaredLogger.Error(err.Error())
 		return "设置失败"
@@ -556,7 +612,7 @@ func (receiver StockDataApi) SetAlarmChangePercent(val, alarmPrice float64, stoc
 		stockCode = strings.Replace(stockCode, "gb_", "us", 1)
 		stockCode = strings.Replace(stockCode, "GB_", "us", 1)
 	}
-	err := db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", strings.ToLower(stockCode)).Updates(&map[string]any{
+	err := db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", normalizeStockCode(stockCode)).Updates(&map[string]any{
 		"alarm_change_percent": val,
 		"alarm_price":          alarmPrice,
 	}).Error
@@ -569,13 +625,13 @@ func (receiver StockDataApi) SetAlarmChangePercent(val, alarmPrice float64, stoc
 
 func (receiver StockDataApi) SetStockSort(newSort int64, stockCode string) {
 	//if strutil.HasPrefixAny(stockCode, []string{"gb_"}) {
-	//	stockCode = strings.ToLower(stockCode)
+	//	stockCode = normalizeStockCode(stockCode)
 	//	stockCode = strings.Replace(stockCode, "gb_", "us", 1)
 	//}
 
 	// 获取当前排序值
 	var currentStock FollowedStock
-	if err := db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", strings.ToLower(stockCode)).First(&currentStock).Error; err != nil {
+	if err := db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", normalizeStockCode(stockCode)).First(&currentStock).Error; err != nil {
 		logger.SugaredLogger.Error("找不到当前股票: ", err.Error())
 		return
 	}
@@ -595,7 +651,7 @@ func (receiver StockDataApi) SetStockSort(newSort int64, stockCode string) {
 	if count == 0 {
 		// 新位置未被占用，直接更新当前记录
 		if err := db.Dao.Model(&FollowedStock{}).
-			Where("stock_code = ?", strings.ToLower(stockCode)).
+			Where("stock_code = ?", normalizeStockCode(stockCode)).
 			Update("sort", newSort).Error; err != nil {
 			logger.SugaredLogger.Error("更新排序位置失败: ", err.Error())
 		}
@@ -619,7 +675,7 @@ func (receiver StockDataApi) SetStockSort(newSort int64, stockCode string) {
 
 		// 更新目标记录的排序
 		if err := db.Dao.Model(&FollowedStock{}).
-			Where("stock_code = ?", strings.ToLower(stockCode)).
+			Where("stock_code = ?", normalizeStockCode(stockCode)).
 			Update("sort", newSort).Error; err != nil {
 			logger.SugaredLogger.Error("更新股票排序失败: ", err.Error())
 		}
@@ -632,7 +688,7 @@ func (receiver StockDataApi) SetStockAICron(cron string, stockCode string) {
 		stockCode = strings.Replace(stockCode, "gb_", "us", 1)
 		stockCode = strings.Replace(stockCode, "GB_", "us", 1)
 	}
-	db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", strings.ToLower(stockCode)).Update("cron", cron)
+	db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", normalizeStockCode(stockCode)).Update("cron", cron)
 
 }
 func (receiver StockDataApi) SetTradingPrice(entryPrice, takeProfitPrice, stopLossPrice, costPrice float64, stockCode string) string {
@@ -648,7 +704,7 @@ func (receiver StockDataApi) SetTradingPrice(entryPrice, takeProfitPrice, stopLo
 	} else if strings.HasPrefix(stockCode, "GB_") {
 		stockCode = strings.Replace(stockCode, "GB_", "us", 1)
 	}
-	lowerStockCode := strings.ToLower(stockCode)
+	lowerStockCode := normalizeStockCode(stockCode)
 
 	var stock FollowedStock
 	if err := db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", lowerStockCode).First(&stock).Error; err != nil {
@@ -761,12 +817,48 @@ func (receiver StockDataApi) GetStockList(key string) []StockBasic {
 		existingStocks[item.SECUCODE] = true
 	}
 
+	// 场内基金（ETF）也纳入搜索：GetFundList 会在本地 FundBasic 缺失时触发东方财富在线搜索并缓存。
+	// 这样即使通达信同步未覆盖 ETF（未重启 / 同步失败 / 本地无缓存），也能立即搜到如 513310 中韩半导体。
+	if key != "" {
+		funds := NewFundApi().GetFundList(key)
+		for _, fund := range funds {
+			if !IsOnExchangeFund(fund.Code) {
+				continue
+			}
+			tsCode := fundCodeToTsCode(fund.Code)
+			if tsCode == "" || existingStocks[tsCode] {
+				continue
+			}
+			result = append(result, StockBasic{
+				TsCode:   tsCode,
+				Name:     fund.Name,
+				Fullname: fund.FullName,
+				Market:   tsCode[len(tsCode)-2:],
+			})
+			existingStocks[tsCode] = true
+		}
+	}
+
 	return result
+}
+
+// fundCodeToTsCode 场内基金纯代码转 ts_code（如 513310 → 513310.SH，159915 → 159915.SZ）
+func fundCodeToTsCode(code string) string {
+	if len(code) == 0 {
+		return ""
+	}
+	if strings.HasPrefix(code, "5") || strings.HasPrefix(code, "6") {
+		return code + ".SH"
+	}
+	if strings.HasPrefix(code, "1") || strings.HasPrefix(code, "0") || strings.HasPrefix(code, "3") {
+		return code + ".SZ"
+	}
+	return code + ".SH"
 }
 
 func (receiver StockDataApi) GetFollowedStockByStockCode(code string) FollowedStock {
 	var result FollowedStock
-	db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", strings.ToLower(code)).First(&result)
+	db.Dao.Model(&FollowedStock{}).Where("stock_code = ?", normalizeStockCode(code)).First(&result)
 	return result
 }
 
@@ -810,6 +902,15 @@ func ParseTxStockData(data string) (*StockInfo, error) {
 		return nil, err
 	}
 	//logger.SugaredLogger.Infof("股票数据解析完成stockInfo: %+v", stockInfo)
+
+	// 量比：strutil.SplitAndTrim 会丢弃空字段（如暂无市盈率的个股），紧凑后的下标会漂移，
+	// 故这里用原始分割按固定下标取值——沪深A股第 49 位为量比，无需额外请求
+	if strutil.HasPrefixAny(stockInfo.Code, []string{"sh", "sz"}) {
+		raw := strings.Split(datas[1], "~")
+		if len(raw) > 49 {
+			stockInfo.VolumeRatio = strutil.Trim(raw[49])
+		}
+	}
 
 	return stockInfo, nil
 
@@ -1468,6 +1569,15 @@ func (receiver StockDataApi) GetStockMinutePriceData(stockCode string) (*[]Minut
 
 	stockCode = ConvertTushareCodeToStockCode(stockCode)
 
+	// 币安 USDT-M 永续合约：走独立分时源（1 分钟 K 线）
+	if IsBinanceFuturesCode(stockCode) {
+		return BinanceMinutePriceData(stockCode), time.Now().In(binanceCST).Format("2006-01-02")
+	}
+	// Bitget 美股永续合约：走独立分时源（1 分钟 K 线）
+	if IsBitgetFuturesCode(stockCode) {
+		return BitgetMinutePriceData(stockCode), time.Now().In(bitgetCST).Format("2006-01-02")
+	}
+
 	url := fmt.Sprintf("https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=%s", stockCode)
 	if strutil.HasPrefixAny(stockCode, []string{"gb_", "GB_"}) {
 		stockCode = strings.Replace(strings.ToUpper(stockCode), "GB_", "us", 1) + ".OQ"
@@ -1498,12 +1608,25 @@ func (receiver StockDataApi) GetStockMinutePriceData(stockCode string) (*[]Minut
 			m := stockData.(map[string]interface{})
 			if d, ok := m["data"]; ok {
 				if m2, ok := d.(map[string]any); ok {
-					minutePriceData := m2["data"]
-					datas := minutePriceData.([]any)
+					if dateStr, ok := m2["date"].(string); ok {
+						date = dateStr
+					}
+					datas, ok := m2["data"].([]any)
+					if !ok {
+						return minuteDatas, date
+					}
 					for _, item := range datas {
-						minuteDataSplit := strutil.SplitEx(strutil.ReplaceWithMap(item.(string), map[string]string{
+						itemStr, ok := item.(string)
+						if !ok {
+							continue
+						}
+						minuteDataSplit := strutil.SplitEx(strutil.ReplaceWithMap(itemStr, map[string]string{
 							"\r\n": " ",
 						}), " ", true)
+						// 休市/停牌时接口会返回占位数据（如 "  0"），字段不足时跳过，避免下标越界
+						if len(minuteDataSplit) < 3 || len(minuteDataSplit[0]) < 4 {
+							continue
+						}
 						price, _ := convertor.ToFloat(minuteDataSplit[1])
 						volume, _ := convertor.ToFloat(minuteDataSplit[2])
 						amount := float64(0)
@@ -1518,7 +1641,6 @@ func (receiver StockDataApi) GetStockMinutePriceData(stockCode string) (*[]Minut
 						}
 						*minuteDatas = append(*minuteDatas, *minuteData)
 					}
-					date = m2["date"].(string)
 				}
 			}
 		}
@@ -2374,6 +2496,7 @@ type KLineData struct {
 	ChangeValue   string            `json:"changeValue" md:"涨跌额"`
 	Amplitude     string            `json:"amplitude" md:"振幅"`
 	TurnoverRate  string            `json:"turnoverRate" md:"换手率"`
+	VolumeRatio   string            `json:"volumeRatio" md:"量比"`
 	MA            map[string]string `json:"ma,omitempty" md:"均线"` // 周期 -> 均线值，如 "5":"12.34"，由 GetKLineWithMA 填充
 }
 
@@ -2551,23 +2674,39 @@ func (receiver StockDataApi) GetStockRZRQInfo(stockCode string) models.StockRZRQ
 
 // AddTradingRecord 添加交易日志
 func (receiver StockDataApi) AddTradingRecord(record TradingRecord) (uint, error) {
-	record.TradingTime = record.TradingTime.In(time.Local)
-
-	// 检查频繁交易
-	if record.Direction == "买入" {
-		canTrade, msg := receiver.CheckFrequentTrading(record.StockCode)
-		if !canTrade {
-			return 0, fmt.Errorf("%s", msg)
-		}
+	// 必填字段校验
+	if strings.TrimSpace(record.StockCode) == "" {
+		return 0, fmt.Errorf("股票代码不能为空")
 	}
-
-	// 自动计算金额（价格 * 数量）
-	record.Amount = record.Price * float64(record.Volume)
+	if strings.TrimSpace(record.StockName) == "" {
+		return 0, fmt.Errorf("股票名称不能为空")
+	}
+	if record.Direction != "买入" && record.Direction != "卖出" {
+		return 0, fmt.Errorf("交易方向只能为买入或卖出")
+	}
+	if record.Price <= 0 {
+		return 0, fmt.Errorf("价格必须大于0")
+	}
+	if record.Volume <= 0 {
+		return 0, fmt.Errorf("成交数量必须大于0")
+	}
+	if record.Fee < 0 {
+		return 0, fmt.Errorf("手续费不能为负数")
+	}
+	if record.StopLossPrice < 0 || record.TakeProfitPrice < 0 {
+		return 0, fmt.Errorf("止损价/止盈价不能为负数")
+	}
 
 	// 设置交易时间为当前时间（如果未提供）
 	if record.TradingTime.IsZero() {
 		record.TradingTime = time.Now()
 	}
+	record.TradingTime = record.TradingTime.In(time.Local)
+
+	// 频繁交易检查仅在前端提示用户，后端不再阻止添加（CheckFrequentTrading 接口保留供前端调用）
+
+	// 自动计算金额（价格 * 数量）
+	record.Amount = record.Price * float64(record.Volume)
 
 	receiver.fillTradingRecordCloseSnapshot(&record)
 
@@ -2659,7 +2798,15 @@ func (receiver StockDataApi) resolveTradingRecordClosePrice(apiCode string, trad
 			}
 		}
 	} else {
-		klines := receiver.GetCommonKLineData(apiCode, "day", 30)
+		// 按交易日期距今天数动态计算 K 线查询数量，避免 30 根不够导致查不到早期记录
+		daysSince := int(now.Sub(tradingTime).Hours()/24) + 10
+		if daysSince < 30 {
+			daysSince = 30
+		}
+		if daysSince > 1000 {
+			daysSince = 1000
+		}
+		klines := receiver.GetCommonKLineData(apiCode, "day", int64(daysSince))
 		if klines != nil {
 			for _, k := range *klines {
 				if k.Day == tradingDateStr {
@@ -2771,7 +2918,15 @@ func (receiver StockDataApi) GetTradingRecordList(query TradingRecordListQuery) 
 		return closePrice
 	}
 
-	stockHoldings := make(map[string][]tradingRecordFIFOLot)
+	// ===== FIFO 持仓引擎 =====
+	// buyLot 记录每次买入的剩余数量（被后续卖出按 FIFO 扣减），recordID 用于回溯关联
+	type buyLot struct {
+		recordID uint
+		volume   int64 // 剩余数量
+		price    float64
+	}
+	holdings := make(map[string][]buyLot)
+
 	// 需要回写收盘价快照的历史记录：RecordedClosePrice == 0 且成功获取到 closePrice
 	type closeBackfill struct {
 		id         uint
@@ -2781,60 +2936,113 @@ func (receiver StockDataApi) GetTradingRecordList(query TradingRecordListQuery) 
 	todayStr := time.Now().Format("2006-01-02")
 	now := time.Now()
 
+	// Phase 1: 按时间顺序遍历全部记录，构建 FIFO 持仓、计算卖出已实现盈亏
 	for _, r := range allGlobal {
 		_, need := needProfitByID[r.ID]
 		apiCode := normalizeTradingRecordAPI(r.StockCode)
 		tradingDateStr := r.TradingTime.In(time.Local).Format("2006-01-02")
 
 		if r.Direction == "买入" {
+			// 加入 FIFO 持仓
+			holdings[r.StockCode] = append(holdings[r.StockCode], buyLot{
+				recordID: r.ID,
+				volume:   r.Volume,
+				price:    r.Price,
+			})
+			// 预解析收盘价并回写快照（仅当前页记录，填充缓存供 Phase 2 使用）
 			if need {
 				closePrice := resolveClose(apiCode, r.TradingTime, r.Price, r.RecordedClosePrice)
-				// 历史交易日：把解析到的收盘价落库，避免每次列表重复拉 K 线
 				if r.RecordedClosePrice == 0 && closePrice > 0 && tradingDateStr != todayStr && !r.TradingTime.After(now) {
 					backfills = append(backfills, closeBackfill{id: r.ID, closePrice: closePrice})
 				}
-				if r.Price > 0 {
-					profitByID[r.ID] = rowProfit{
-						closePrice:    closePrice,
-						profitAmount:  (closePrice-r.Price)*float64(r.Volume) - r.Fee,
-						profitPercent: (closePrice - r.Price) / r.Price * 100,
-					}
-				} else {
-					profitByID[r.ID] = rowProfit{closePrice: closePrice}
-				}
 			}
-			stockHoldings[r.StockCode] = append(stockHoldings[r.StockCode], tradingRecordFIFOLot{Volume: r.Volume, Price: r.Price})
 		} else if r.Direction == "卖出" {
-			if need {
-				avgCost, ok := fifoAvgUnitCost(stockHoldings[r.StockCode], r.Volume)
-				closePrice := resolveClose(apiCode, r.TradingTime, r.Price, r.RecordedClosePrice)
-				if r.RecordedClosePrice == 0 && closePrice > 0 && tradingDateStr != todayStr && !r.TradingTime.After(now) {
-					backfills = append(backfills, closeBackfill{id: r.ID, closePrice: closePrice})
-				}
-				if ok && avgCost > 0 {
-					profitByID[r.ID] = rowProfit{
-						closePrice:    closePrice,
-						profitAmount:  (r.Price-avgCost)*float64(r.Volume) - r.Fee,
-						profitPercent: (r.Price - avgCost) / avgCost * 100,
-					}
-				} else {
-					profitByID[r.ID] = rowProfit{closePrice: closePrice}
-				}
-			}
+			// FIFO 扣减持仓并计算卖出对应的成本（合并计算与扣减，避免状态不一致）
 			remaining := r.Volume
-			for i := range stockHoldings[r.StockCode] {
-				if remaining == 0 {
+			var fifoCost float64
+			var effectiveVol int64
+			for i := range holdings[r.StockCode] {
+				if remaining <= 0 {
 					break
 				}
-				rec := &stockHoldings[r.StockCode][i]
-				if rec.Volume <= remaining {
-					remaining -= rec.Volume
-					rec.Volume = 0
+				lot := &holdings[r.StockCode][i]
+				if lot.volume <= 0 {
+					continue
+				}
+				take := remaining
+				if take > lot.volume {
+					take = lot.volume
+				}
+				fifoCost += float64(take) * lot.price
+				lot.volume -= take
+				remaining -= take
+				effectiveVol += take
+			}
+			if effectiveVol < r.Volume && effectiveVol >= 0 {
+				logger.SugaredLogger.Warnf("交易日志: 股票 %s 卖出 %d 股超出持仓 %d 股，仅按 %d 股计算",
+					r.StockCode, r.Volume, effectiveVol, effectiveVol)
+			}
+
+			if need {
+				closePrice := resolveClose(apiCode, r.TradingTime, r.Price, r.RecordedClosePrice)
+				if r.RecordedClosePrice == 0 && closePrice > 0 && tradingDateStr != todayStr && !r.TradingTime.After(now) {
+					backfills = append(backfills, closeBackfill{id: r.ID, closePrice: closePrice})
+				}
+				if effectiveVol > 0 {
+					// 已实现盈亏 = 卖出收入 - FIFO成本 - 手续费
+					profitAmount := r.Price*float64(effectiveVol) - fifoCost - r.Fee
+					profitPercent := 0.0
+					if fifoCost > 0 {
+						profitPercent = profitAmount / fifoCost * 100
+					}
+					profitByID[r.ID] = rowProfit{
+						closePrice:    closePrice,
+						profitAmount:  profitAmount,
+						profitPercent: profitPercent,
+					}
 				} else {
-					rec.Volume -= remaining
-					remaining = 0
+					// 无持仓却卖出，数据异常，仅显示收盘价不计算盈亏
+					profitByID[r.ID] = rowProfit{closePrice: closePrice}
 				}
 			}
+		}
+	}
+
+	// Phase 2: 计算买入记录的浮动盈亏（仅对剩余未卖出部分）
+	for _, r := range records {
+		if r.Direction != "买入" {
+			continue
+		}
+		apiCode := normalizeTradingRecordAPI(r.StockCode)
+		closePrice := resolveClose(apiCode, r.TradingTime, r.Price, r.RecordedClosePrice)
+
+		// 查找该买入记录的剩余数量（FIFO 扣减后的余额）
+		remainingVol := int64(0)
+		for _, lot := range holdings[r.StockCode] {
+			if lot.recordID == r.ID {
+				remainingVol += lot.volume
+			}
+		}
+
+		if remainingVol > 0 {
+			// 浮动盈亏 = (现价 - 买入价) * 剩余数量 - 按比例分摊的手续费
+			profitAmount := (closePrice - r.Price) * float64(remainingVol)
+			if r.Volume > 0 && r.Fee > 0 {
+				profitAmount -= r.Fee * float64(remainingVol) / float64(r.Volume)
+			}
+			profitPercent := 0.0
+			costBase := r.Price * float64(remainingVol)
+			if costBase > 0 {
+				profitPercent = profitAmount / costBase * 100
+			}
+			profitByID[r.ID] = rowProfit{
+				closePrice:    closePrice,
+				profitAmount:  profitAmount,
+				profitPercent: profitPercent,
+			}
+		} else {
+			// 已全部卖出，盈亏已体现在卖出记录中，买入行显示 0
+			profitByID[r.ID] = rowProfit{closePrice: closePrice, profitAmount: 0, profitPercent: 0}
 		}
 	}
 
@@ -2878,12 +3086,16 @@ func (receiver StockDataApi) GetTradingRecordList(query TradingRecordListQuery) 
 }
 
 // GetTradingRecordStatistics 获取交易日志统计数据
+// 统计始终基于全部历史记录构建FIFO，确保总盈亏与当日盈亏真实准确，不受列表筛选条件影响
 func (receiver StockDataApi) GetTradingRecordStatistics() (*TradingRecordStatistics, error) {
+	// FIFO 持仓批次，使用指针便于卖出扣减时直接修改剩余数量
 	type BuyRecord struct {
-		Volume int64
-		Price  float64
+		Volume  int64
+		Price   float64
+		IsToday bool // 标记是否今日买入，用于遍历结束后计算今日浮动盈亏
 	}
 
+	// 统计基于全部记录，FIFO需要完整历史才能正确计算持仓成本与已实现盈亏
 	var records []TradingRecord
 	err := db.Dao.Model(&TradingRecord{}).Order("trading_time ASC, id ASC").Find(&records).Error
 	if err != nil {
@@ -2891,35 +3103,87 @@ func (receiver StockDataApi) GetTradingRecordStatistics() (*TradingRecordStatist
 		return nil, err
 	}
 
-	stockMap := make(map[string][]BuyRecord)
+	stockMap := make(map[string][]*BuyRecord)
 	totalBuyAmount := 0.0
 	totalSellAmount := 0.0
 	holdingsCost := 0.0
 	holdingsValue := 0.0
 	costOfSoldShares := 0.0
+	totalFee := 0.0 // 累计买入+卖出手续费（仅有效记录），与列表行 profitAmount 口径一致
+
+	// 当日盈亏统计
+	todayStr := time.Now().Format("2006-01-02")
+	todayBuyAmount := 0.0
+	todaySellAmount := 0.0
+	todayRealizedProfit := 0.0
+	todayFloatingProfit := 0.0
+	todayCostOfSold := 0.0 // 今日卖出对应的FIFO成本，用于收益率分母
+	todayBuyFee := 0.0     // 今日买入手续费（在 todayProfit 中统一扣除，避免按比例分配到批次）
 
 	for _, r := range records {
-		amount := r.Price * float64(r.Volume)
+		isToday := r.TradingTime.In(time.Local).Format("2006-01-02") == todayStr
 		if r.Direction == "买入" {
+			amount := r.Price * float64(r.Volume)
+			totalFee += r.Fee
 			totalBuyAmount += amount
-			stockMap[r.StockCode] = append(stockMap[r.StockCode], BuyRecord{Volume: r.Volume, Price: r.Price})
+			stockMap[r.StockCode] = append(stockMap[r.StockCode], &BuyRecord{Volume: r.Volume, Price: r.Price, IsToday: isToday})
+			if isToday {
+				todayBuyAmount += amount
+				todayBuyFee += r.Fee
+			}
 		} else if r.Direction == "卖出" {
-			totalSellAmount += amount
-			remainingVolume := r.Volume
+			// 检查卖出数量是否超出当前持仓，超出部分不计入卖出收入与成本（避免利润虚高）
+			availableVolume := int64(0)
+			for _, br := range stockMap[r.StockCode] {
+				if br.Volume > 0 {
+					availableVolume += br.Volume
+				}
+			}
+			effectiveSellVolume := r.Volume
+			if r.Volume > availableVolume {
+				if availableVolume > 0 {
+					logger.SugaredLogger.Warnf("交易日志统计: 股票 %s 卖出量 %d 超出持仓 %d，仅按 %d 股计算",
+						r.StockCode, r.Volume, availableVolume, availableVolume)
+					effectiveSellVolume = availableVolume
+				} else {
+					logger.SugaredLogger.Warnf("交易日志统计: 股票 %s 无持仓却记录卖出 %d 股，跳过该记录",
+						r.StockCode, r.Volume)
+					effectiveSellVolume = 0
+				}
+			}
+			if effectiveSellVolume <= 0 {
+				// 无有效卖出，不计入手续费（数据异常由用户修正）
+				continue
+			}
+			// 有效卖出才累加手续费（含截断情况，实际已支付）
+			totalFee += r.Fee
+			// 卖出收入按有效卖出数量折算
+			sellRevenue := r.Price * float64(effectiveSellVolume)
+			totalSellAmount += sellRevenue
+			// FIFO 扣减并累加成本，记录扣减前后的差值用于当日已实现盈亏计算
+			costBefore := costOfSoldShares
+			remainingVolume := effectiveSellVolume
 			for i := range stockMap[r.StockCode] {
 				if remainingVolume == 0 {
 					break
 				}
-				record := &stockMap[r.StockCode][i]
-				if record.Volume <= remainingVolume {
-					costOfSoldShares += float64(record.Volume) * record.Price
-					remainingVolume -= record.Volume
-					record.Volume = 0
+				lot := stockMap[r.StockCode][i]
+				if lot.Volume <= remainingVolume {
+					costOfSoldShares += float64(lot.Volume) * lot.Price
+					remainingVolume -= lot.Volume
+					lot.Volume = 0
 				} else {
-					costOfSoldShares += float64(remainingVolume) * record.Price
-					record.Volume -= remainingVolume
+					costOfSoldShares += float64(remainingVolume) * lot.Price
+					lot.Volume -= remainingVolume
 					remainingVolume = 0
 				}
+			}
+			if isToday {
+				deltaCost := costOfSoldShares - costBefore
+				todaySellAmount += sellRevenue
+				todayCostOfSold += deltaCost
+				// 卖出已实现盈亏（含亏损），扣除卖出手续费
+				todayRealizedProfit += sellRevenue - deltaCost - r.Fee
 			}
 		}
 	}
@@ -2928,10 +3192,17 @@ func (receiver StockDataApi) GetTradingRecordStatistics() (*TradingRecordStatist
 	for code, buyRecords := range stockMap {
 		currentVolume := int64(0)
 		currentCost := 0.0
+		// 今日买入未卖出的剩余数量与成本
+		todayBuyRemainingVolume := int64(0)
+		todayBuyRemainingCost := 0.0
 		for _, br := range buyRecords {
 			if br.Volume > 0 {
 				currentVolume += br.Volume
 				currentCost += float64(br.Volume) * br.Price
+				if br.IsToday {
+					todayBuyRemainingVolume += br.Volume
+					todayBuyRemainingCost += float64(br.Volume) * br.Price
+				}
 			}
 		}
 		if currentVolume > 0 {
@@ -2948,32 +3219,62 @@ func (receiver StockDataApi) GetTradingRecordStatistics() (*TradingRecordStatist
 				}
 				if price > 0 {
 					holdingsValue += price * float64(currentVolume)
+
+					// 当日浮动盈亏 = 历史持仓今日浮盈变化 + 今日买入未卖出浮盈
+					historicalVolume := currentVolume - todayBuyRemainingVolume
+					// 历史持仓（昨日及之前买入今日仍持有）按 (现价 - 昨收) 计算今日涨跌
+					if historicalVolume > 0 {
+						zrsp, _ := convertor.ToFloat(stock.PreClose)
+						if zrsp > 0 {
+							todayFloatingProfit += (price - zrsp) * float64(historicalVolume)
+						}
+					}
+					// 今日买入未卖出部分按 (现价 - 买入价) 计算浮盈
+					if todayBuyRemainingVolume > 0 {
+						todayFloatingProfit += price*float64(todayBuyRemainingVolume) - todayBuyRemainingCost
+					}
 				}
 			}
 		}
 	}
 
-	totalProfit := totalSellAmount - costOfSoldShares + (holdingsValue - holdingsCost)
-	profitRate := 0.0
-	denom := holdingsCost
-	if denom <= 0 && costOfSoldShares > 0 {
-		denom = costOfSoldShares
-	}
+	// 总盈亏 = 已实现盈亏(卖出收入-卖出成本) + 未实现浮盈(持仓市值-持仓成本) - 累计手续费
+	totalProfit := totalSellAmount - costOfSoldShares + (holdingsValue - holdingsCost) - totalFee
+	// 收益率分母 = 总投入成本（剩余持仓成本 + 已卖出部分成本），避免部分清仓后收益率被放大
+	denom := holdingsCost + costOfSoldShares
 	if denom <= 0 && totalBuyAmount > 0 {
+		// 完全清仓且无持仓时，回退到总买入额
 		denom = totalBuyAmount
 	}
+	profitRate := 0.0
 	if denom > 0 {
 		profitRate = (totalProfit / denom) * 100
 	}
 
+	// 当日总盈亏 = 已实现盈亏(扣卖出手续费) + 浮动盈亏 - 今日买入手续费
+	// 浮动盈亏包含：历史持仓今日涨跌(现价-昨收) + 今日买入未卖出浮盈(现价-买入价)
+	todayProfit := todayRealizedProfit + todayFloatingProfit - todayBuyFee
+	// 收益率分母 = 今日买入金额 + 今日卖出对应的FIFO成本
+	todayDenom := todayBuyAmount + todayCostOfSold
+	todayProfitRate := 0.0
+	if todayDenom > 0 {
+		todayProfitRate = (todayProfit / todayDenom) * 100
+	}
+
 	return &TradingRecordStatistics{
-		TotalBuyAmount:  totalBuyAmount,
-		TotalSellAmount: totalSellAmount,
-		TotalProfit:     totalProfit,
-		ProfitRate:      profitRate,
-		HoldingsAmount:  holdingsCost,
-		CurrentValue:    holdingsValue,
-		StockCount:      stockCount,
+		TotalBuyAmount:      totalBuyAmount,
+		TotalSellAmount:     totalSellAmount,
+		TotalProfit:         totalProfit,
+		ProfitRate:          profitRate,
+		HoldingsAmount:      holdingsCost,
+		CurrentValue:        holdingsValue,
+		StockCount:          stockCount,
+		TodayBuyAmount:      todayBuyAmount,
+		TodaySellAmount:     todaySellAmount,
+		TodayRealizedProfit: todayRealizedProfit,
+		TodayFloatingProfit: todayFloatingProfit,
+		TodayProfit:         todayProfit,
+		TodayProfitRate:     todayProfitRate,
 	}, nil
 }
 
@@ -2993,23 +3294,72 @@ func (receiver StockDataApi) GetTradingRecordById(id uint) (*TradingRecord, erro
 
 // UpdateTradingRecord 更新交易日志
 func (receiver StockDataApi) UpdateTradingRecord(record TradingRecord) error {
-	logger.SugaredLogger.Infof("UpdateTradingRecord: %v", record)
+	if record.ID == 0 {
+		return fmt.Errorf("记录ID不能为空")
+	}
+	if strings.TrimSpace(record.StockCode) == "" {
+		return fmt.Errorf("股票代码不能为空")
+	}
+	if record.Direction != "买入" && record.Direction != "卖出" {
+		return fmt.Errorf("交易方向只能为买入或卖出")
+	}
+	if record.Price <= 0 {
+		return fmt.Errorf("价格必须大于0")
+	}
+	if record.Volume <= 0 {
+		return fmt.Errorf("成交数量必须大于0")
+	}
+	if record.Fee < 0 {
+		return fmt.Errorf("手续费不能为负数")
+	}
+	if record.StopLossPrice < 0 || record.TakeProfitPrice < 0 {
+		return fmt.Errorf("止损价/止盈价不能为负数")
+	}
+
 	// 自动计算金额（价格 * 数量）
 	record.Amount = record.Price * float64(record.Volume)
 
+	if record.TradingTime.IsZero() {
+		record.TradingTime = time.Now()
+	}
 	record.TradingTime = record.TradingTime.In(time.Local)
 
-	receiver.fillTradingRecordCloseSnapshot(&record)
-
-	err := db.Dao.Model(&TradingRecord{}).Where("id = ?", record.ID).Updates(&record).Error
-	if err != nil {
-		logger.SugaredLogger.Errorf("更新交易日志失败: %s", err.Error())
+	// 查询原记录：仅当交易时间变化或快照为0时才重新拉取收盘价
+	var old TradingRecord
+	if err := db.Dao.Model(&TradingRecord{}).Where("id = ?", record.ID).First(&old).Error; err != nil {
+		logger.SugaredLogger.Errorf("查询原交易日志失败: %s", err.Error())
 		return err
 	}
-	// Updates(struct) 会忽略零值字段，收盘价快照单独写入保证落库
-	if err := db.Dao.Model(&TradingRecord{}).Where("id = ?", record.ID).
-		Update("recorded_close_price", record.RecordedClosePrice).Error; err != nil {
-		logger.SugaredLogger.Errorf("更新交易日志收盘价快照失败: %s", err.Error())
+	oldTradingDate := old.TradingTime.In(time.Local).Format("2006-01-02")
+	newTradingDate := record.TradingTime.Format("2006-01-02")
+	needRefreshSnapshot := old.RecordedClosePrice == 0 || oldTradingDate != newTradingDate
+	if needRefreshSnapshot {
+		receiver.fillTradingRecordCloseSnapshot(&record)
+	} else {
+		// 保留原快照，避免编辑历史记录时被错误覆盖
+		record.RecordedClosePrice = old.RecordedClosePrice
+	}
+
+	// 使用 map 更新避免 Gorm struct 模式忽略零值字段（止损价/止盈价/手续费/Reason/Mindset 等）
+	// 注意：Amount 标记为 gorm:"-"（计算字段，非数据库列），不应出现在 updates 中
+	updates := map[string]any{
+		"stock_code":           record.StockCode,
+		"stock_name":           record.StockName,
+		"direction":            record.Direction,
+		"price":                record.Price,
+		"volume":               record.Volume,
+		"trading_time":         record.TradingTime,
+		"reason":               record.Reason,
+		"stop_loss_price":      record.StopLossPrice,
+		"take_profit_price":    record.TakeProfitPrice,
+		"fee":                  record.Fee,
+		"market_value":         record.MarketValue,
+		"mindset":              record.Mindset,
+		"recorded_close_price": record.RecordedClosePrice,
+	}
+	err := db.Dao.Model(&TradingRecord{}).Where("id = ?", record.ID).Updates(updates).Error
+	if err != nil {
+		logger.SugaredLogger.Errorf("更新交易日志失败: %s", err.Error())
 		return err
 	}
 	return nil
@@ -3023,6 +3373,539 @@ func (receiver StockDataApi) DeleteTradingRecord(id uint) error {
 		return err
 	}
 	return nil
+}
+
+// TradingRecordImportResult 交易日志批量导入结果
+type TradingRecordImportResult struct {
+	Total    int    `json:"total"`    // 文件总记录数
+	Imported int    `json:"imported"` // 成功导入条数
+	Skipped  int    `json:"skipped"`  // 跳过（已存在/重复）条数
+	Failed   int    `json:"failed"`   // 解析失败条数
+	Message  string `json:"message"`  // 汇总提示
+}
+
+// parseTradingImportFile 解析券商导出的成交记录文件。
+// 支持三类内容：
+//  1. 真正的 .xlsx 文件（zip 格式，经 excelize 解析）
+//  2. UTF-8 编码的表格文本（Tab 分隔，或 .csv 的逗号分隔）
+//  3. GBK 编码的表格文本（自动转码）
+//
+// 表头行定位：扫描前 10 行找到同时含日期列（成交日期/发生日期）与「证券代码」的行作为表头
+// （兼容文件头带说明行、以及东方财富交割单用「发生日期」的情况），
+// 返回以表头名为 key 的原始数据行数组。
+func parseTradingImportFile(filePath string) ([]map[string]string, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	// xlsx 是 zip 包（PK 魔数），走 excelize 解析
+	if len(data) > 4 && bytes.Equal(data[:2], []byte("PK")) {
+		return parseTradingImportXLSX(data)
+	}
+
+	// GBK → UTF-8（仅当内容不是合法 UTF-8 时转码）
+	if !utf8.Valid(data) {
+		reader := transform.NewReader(bytes.NewReader(data), simplifiedchinese.GBK.NewDecoder())
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, reader); err == nil {
+			data = buf.Bytes()
+		}
+	}
+
+	text := string(data)
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("文件内容为空")
+	}
+
+	// 扫描前 10 行定位表头（兼容 # 说明行开头的老模板/券商文件头）
+	headerIdx := -1
+	scanMax := len(lines)
+	if scanMax > 10 {
+		scanMax = 10
+	}
+	// 分隔符：券商「表格文本」导出为 Tab，直接导出的 .csv 为逗号，按能否识别出表头择优。
+	delim := "\t"
+	var colIdx map[string]int
+	for i := 0; i < scanMax; i++ {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		for _, d := range []string{"\t", ","} {
+			if idx := buildTradingColIdx(strings.Split(lines[i], d)); idx != nil {
+				headerIdx, colIdx, delim = i, idx, d
+				break
+			}
+		}
+		if headerIdx >= 0 {
+			break
+		}
+	}
+	if headerIdx < 0 {
+		return nil, fmt.Errorf("无法识别的成交记录文件格式：前 10 行中未找到同时含「成交日期/发生日期」与「证券代码」的表头行")
+	}
+
+	rows := make([]map[string]string, 0, len(lines)-headerIdx-1)
+	for _, line := range lines[headerIdx+1:] {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Split(line, delim)
+		row := make(map[string]string, len(colIdx))
+		for name, i := range colIdx {
+			if i < len(fields) {
+				row[name] = cleanImportCell(fields[i])
+			}
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+// tradingImportAliases 规范字段 → 各券商导出表头别名（按优先级从高到低）。
+// 用于抹平不同券商/不同导出口径的列名差异，典型如东方财富：
+//   - 成交明细（历史成交）：买卖标志 / 成交价格
+//   - 交割单（对账单）  ：发生日期 / 业务名称(证券买入、证券卖出) / 佣金 / 过户费 / 其他费
+var tradingImportAliases = map[string][]string{
+	"date":        {"成交日期", "发生日期", "交割日期", "委托日期"},
+	"time":        {"成交时间", "委托时间"},
+	"code":        {"证券代码"},
+	"name":        {"证券名称"},
+	"market":      {"市场名称", "交易市场"},
+	"direction":   {"操作", "买卖标志", "业务名称"},
+	"price":       {"成交均价", "成交价格"},
+	"volume":      {"成交数量"},
+	"fee":         {"手续费", "佣金"},
+	"stampTax":    {"印花税"},
+	"transferFee": {"过户费"},
+	"otherFee":    {"其他杂费", "其他费"},
+	// 成交编号用于区分同一秒内同价同量的多笔真实成交（交割单无「成交时间」时尤其重要）
+	"ref": {"成交编号", "合同编号", "委托编号"},
+}
+
+// pickImportField 按别名优先级从一行数据中取第一个非空值。
+func pickImportField(row map[string]string, field string) string {
+	for _, name := range tradingImportAliases[field] {
+		if v, ok := row[name]; ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// headerHasField 判断表头是否含某个规范字段的任一别名。
+func headerHasField(header []string, field string) bool {
+	for _, cell := range header {
+		cell = strings.TrimSpace(cell)
+		for _, alias := range tradingImportAliases[field] {
+			if cell == alias {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// buildTradingColIdx 由表头单元格构建列名→下标映射。
+// 需同时含「日期」与「证券代码」类列才认作表头行（兼容不同券商的日期列命名）。
+func buildTradingColIdx(header []string) map[string]int {
+	colIdx := make(map[string]int, len(header))
+	for i, name := range header {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := colIdx[name]; !ok {
+			colIdx[name] = i
+		}
+	}
+	if !headerHasField(header, "date") || !headerHasField(header, "code") {
+		return nil
+	}
+	return colIdx
+}
+
+// cleanImportCell 去除单元格首尾空白与包裹的引号（兼容 .csv 直接导出）。
+func cleanImportCell(s string) string {
+	return strings.Trim(strings.TrimSpace(s), `"`)
+}
+
+// normalizeTradingDirection 将券商导出的方向字段归一化为「买入」/「卖出」。
+// 兼容 操作/买卖标志 的 买入、卖出，以及东方财富交割单 业务名称 的 证券买入、证券卖出、融资买入 等；
+// 红利入账、利息归本、银行转存、申购中签、新股入账 等非交易业务返回空串（导入时跳过）。
+func normalizeTradingDirection(v string) string {
+	switch {
+	case strings.Contains(v, "买入"):
+		return "买入"
+	case strings.Contains(v, "卖出"):
+		return "卖出"
+	}
+	return ""
+}
+
+// parseTradingImportXLSX 用 excelize 解析真正的 xlsx 成交记录。
+// 逐 sheet 扫描前 10 行定位表头行（同时含日期列与证券代码列），其下非空行转为 map；
+// 命中一个 sheet 即返回（模板/券商文件通常仅一个数据 sheet）。
+func parseTradingImportXLSX(data []byte) ([]map[string]string, error) {
+	f, err := excelize.OpenReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("解析 xlsx 文件失败: %w", err)
+	}
+	defer f.Close()
+
+	for _, sheet := range f.GetSheetList() {
+		allRows, err := f.GetRows(sheet)
+		if err != nil || len(allRows) == 0 {
+			continue
+		}
+		scanMax := len(allRows)
+		if scanMax > 10 {
+			scanMax = 10
+		}
+		for i := 0; i < scanMax; i++ {
+			colIdx := buildTradingColIdx(allRows[i])
+			if colIdx == nil {
+				continue
+			}
+			rows := make([]map[string]string, 0, len(allRows)-i-1)
+			for _, cells := range allRows[i+1:] {
+				// 跳过整行为空的行
+				empty := true
+				for _, c := range cells {
+					if strings.TrimSpace(c) != "" {
+						empty = false
+						break
+					}
+				}
+				if empty {
+					continue
+				}
+				row := make(map[string]string, len(colIdx))
+				for name, j := range colIdx {
+					if j < len(cells) {
+						row[name] = cleanImportCell(cells[j])
+					}
+				}
+				rows = append(rows, row)
+			}
+			return rows, nil
+		}
+	}
+	return nil, fmt.Errorf("无法识别的成交记录文件格式：各 sheet 前 10 行中未找到同时含日期与证券代码的表头行")
+}
+
+// normalizeImportedStockCode 将券商导出的证券代码归一化为前缀格式。
+// 结合「市场名称」（上海Ａ股/深圳Ａ股/北京…）确定交易所前缀，并将纯数字代码补齐为 6 位。
+func normalizeImportedStockCode(code, market string) string {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return ""
+	}
+	lower := strings.ToLower(code)
+	// 已带前缀（sh/sz/bj/hk/us）直接走统一归一化
+	if strings.HasPrefix(lower, "sh") || strings.HasPrefix(lower, "sz") ||
+		strings.HasPrefix(lower, "bj") || strings.HasPrefix(lower, "hk") ||
+		strings.HasPrefix(lower, "us") {
+		return normalizeStockCode(code)
+	}
+	if strings.Contains(code, ".") {
+		return normalizeStockCode(code)
+	}
+
+	// 提取纯数字部分
+	var digits strings.Builder
+	for _, c := range code {
+		if c >= '0' && c <= '9' {
+			digits.WriteRune(c)
+		}
+	}
+	numStr := digits.String()
+	if numStr == "" {
+		return ""
+	}
+
+	// 按市场名称确定前缀（兼容「上海Ａ股」中文写法与「SH/SZ/BJ/HK」代码写法）
+	upperMarket := strings.ToUpper(market)
+	var prefix string
+	switch {
+	case strings.Contains(market, "上海"), strings.Contains(market, "沪"), strings.Contains(upperMarket, "SH"):
+		prefix = "sh"
+	case strings.Contains(market, "深圳"), strings.Contains(market, "深"), strings.Contains(upperMarket, "SZ"):
+		prefix = "sz"
+	case strings.Contains(market, "北京"), strings.Contains(market, "京"), strings.Contains(upperMarket, "BJ"):
+		prefix = "bj"
+	case strings.Contains(market, "港"), strings.Contains(upperMarket, "HK"):
+		prefix = "hk"
+	}
+	if prefix == "" {
+		// 无市场信息时按首位数字兜底
+		return normalizeStockCode(code)
+	}
+	if prefix == "hk" {
+		// 港股代码 5 位，不足补前导 0
+		for len(numStr) < 5 {
+			numStr = "0" + numStr
+		}
+		return prefix + numStr
+	}
+	// A 股/北交所 6 位，不足补前导 0
+	for len(numStr) < 6 {
+		numStr = "0" + numStr
+	}
+	if len(numStr) > 6 {
+		numStr = numStr[:6]
+	}
+	return prefix + numStr
+}
+
+// parseTradingImportTime 解析成交日期与成交时间（如 20260812 + 14:15:41）。
+func parseTradingImportTime(dateStr, timeStr string) (time.Time, error) {
+	ds := strings.TrimSpace(dateStr)
+	ts := strings.TrimSpace(timeStr)
+	if ds == "" {
+		return time.Time{}, fmt.Errorf("成交日期为空")
+	}
+	datePart := strings.ReplaceAll(ds, "-", "")
+	if len(datePart) != 8 {
+		return time.Time{}, fmt.Errorf("成交日期格式错误: %s", ds)
+	}
+	layout := "20060102"
+	s := datePart
+	if ts != "" {
+		s += " " + ts
+		layout += " 15:04:05"
+	}
+	t, err := time.ParseInLocation(layout, s, time.Local)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("成交时间解析失败: %s %s", ds, ts)
+	}
+	return t, nil
+}
+
+// parseFloatSafe 安全解析浮点字符串，失败返回 0。
+func parseFloatSafe(s string) float64 {
+	v, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	return v
+}
+
+// ImportTradingRecords 批量导入券商导出的成交记录。
+// 列名经别名表（tradingImportAliases）归一，兼容东方财富「成交明细」与「交割单（对账单）」两种口径。
+// 交割单中的非交易业务（红利入账/利息归本/银行转存/申购中签等）会跳过，不计入失败。
+// 同一文件中重复或与数据库已存在（股票代码+方向+交易时间+价格+数量完全一致）的记录会跳过。
+func (receiver StockDataApi) ImportTradingRecords(filePath string) (*TradingRecordImportResult, error) {
+	rows, err := parseTradingImportFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	result := &TradingRecordImportResult{Total: len(rows)}
+
+	// 加载已有记录作为去重键（个人交易日志数据量有限，全量加载即可）
+	existingKeys := make(map[string]struct{})
+	var existing []TradingRecord
+	if err := db.Dao.Model(&TradingRecord{}).Find(&existing).Error; err == nil {
+		for _, r := range existing {
+			existingKeys[tradingRecordDedupKey(r.StockCode, r.Direction, r.TradingTime, r.Price, r.Volume)] = struct{}{}
+		}
+	}
+	seenInFile := make(map[string]struct{})
+
+	var toCreate []TradingRecord
+	for _, row := range rows {
+		rawDirection := pickImportField(row, "direction")
+		direction := normalizeTradingDirection(rawDirection)
+		if direction == "" {
+			// 有方向列但不是买卖（如东方财富交割单的红利入账/利息归本/银行转存/申购中签）
+			// 属于正常的非交易业务，跳过即可，不计入失败。
+			if rawDirection != "" {
+				result.Skipped++
+			} else {
+				result.Failed++
+			}
+			continue
+		}
+		stockName := pickImportField(row, "name")
+		stockCode := normalizeImportedStockCode(pickImportField(row, "code"), pickImportField(row, "market"))
+		if stockCode == "" || stockName == "" {
+			result.Failed++
+			continue
+		}
+		price := parseFloatSafe(pickImportField(row, "price"))
+		volume := int64(parseFloatSafe(pickImportField(row, "volume")))
+		if price <= 0 || volume <= 0 {
+			result.Failed++
+			continue
+		}
+		t, err := parseTradingImportTime(pickImportField(row, "date"), pickImportField(row, "time"))
+		if err != nil {
+			result.Failed++
+			continue
+		}
+		// 手续费 = 手续费/佣金 + 印花税 + 过户费 + 其他费，使盈亏计算更准确
+		fee := parseFloatSafe(pickImportField(row, "fee")) +
+			parseFloatSafe(pickImportField(row, "stampTax")) +
+			parseFloatSafe(pickImportField(row, "transferFee")) +
+			parseFloatSafe(pickImportField(row, "otherFee"))
+
+		rec := TradingRecord{
+			StockCode:   stockCode,
+			StockName:   stockName,
+			Direction:   direction,
+			Price:       price,
+			Volume:      volume,
+			Fee:         fee,
+			TradingTime: t,
+			Amount:      price * float64(volume),
+		}
+		key := tradingRecordDedupKey(rec.StockCode, rec.Direction, rec.TradingTime, rec.Price, rec.Volume)
+		if _, ok := existingKeys[key]; ok {
+			result.Skipped++
+			continue
+		}
+		// 文件内去重额外带上成交编号：交割单无「成交时间」，同一天同价同量的多笔真实成交
+		// 仅靠基础键会被误判为重复而丢弃。与库中记录的比对仍用基础键，保证重复导入仍幂等。
+		fileKey := key
+		if ref := pickImportField(row, "ref"); ref != "" {
+			fileKey = key + "|" + ref
+		}
+		if _, ok := seenInFile[fileKey]; ok {
+			result.Skipped++
+			continue
+		}
+		seenInFile[fileKey] = struct{}{}
+		toCreate = append(toCreate, rec)
+	}
+
+	// 批量写入（事务，分批插入），不逐条拉取收盘价快照（由列表/统计按需回填，避免大量网络请求）
+	if len(toCreate) > 0 {
+		err := db.Dao.Transaction(func(tx *gorm.DB) error {
+			const batchSize = 200
+			for i := 0; i < len(toCreate); i += batchSize {
+				end := i + batchSize
+				if end > len(toCreate) {
+					end = len(toCreate)
+				}
+				if err := tx.Create(toCreate[i:end]).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			logger.SugaredLogger.Errorf("批量导入交易日志失败: %s", err.Error())
+			return nil, err
+		}
+	}
+	result.Imported = len(toCreate)
+	result.Message = fmt.Sprintf("共 %d 条：成功导入 %d 条，跳过 %d 条，失败 %d 条",
+		result.Total, result.Imported, result.Skipped, result.Failed)
+	return result, nil
+}
+
+// tradingRecordTemplateHeader 导入模板表头（列顺序与 parseTradingImportFile 解析所需列对齐）。
+var tradingRecordTemplateHeader = []string{
+	"成交日期", "成交时间", "证券代码", "证券名称", "市场名称", "操作", "成交均价", "成交数量", "手续费", "印花税", "其他杂费",
+}
+
+// tradingRecordTemplateExamples 模板示例数据行（日期用 2026-08-12 形式，解析器自动去 - 兼容）。
+var tradingRecordTemplateExamples = [][]interface{}{
+	{"2026-08-12", "09:31:05", "600519", "贵州茅台", "上海Ａ股", "买入", 1685.50, 200, 5.74, 0.00, 0.01},
+	{"2026-08-15", "10:22:41", "300750", "宁德时代", "深圳Ａ股", "买入", 182.30, 300, 1.09, 0.00, 0.00},
+	{"2026-08-20", "14:05:18", "600519", "贵州茅台", "上海Ａ股", "卖出", 1720.00, 200, 4.30, 3.44, 0.01},
+}
+
+// TradingRecordTemplateXLSX 生成 Excel（.xlsx）格式的交易记录导入模板。
+// 两个 sheet：「使用说明」（填写规则）+「交易记录」（表头 + 3 行示例，示例行可删）。
+// 由 App 层写入选定的保存路径。
+func (receiver StockDataApi) TradingRecordTemplateXLSX() ([]byte, error) {
+	f := excelize.NewFile()
+	defer f.Close()
+
+	// Sheet 1：使用说明
+	instrSheet := "使用说明"
+	if err := f.SetSheetName("Sheet1", instrSheet); err != nil {
+		return nil, err
+	}
+	instructions := []string{
+		"go-stock 交易记录导入模板使用说明",
+		"",
+		"1. 推荐直接从券商软件导出「历史成交/交割单」后导入，无需使用本模板。",
+		"   常见路径：交易-查询-历史成交/交割单，选好日期区间导出 .xls/.xlsx/.csv。",
+		"   东方财富：「成交明细（历史成交）」与「交割单（对账单）」两种导出均已适配，",
+		"   含 发生日期/买卖标志/业务名称/成交价格/佣金/过户费/其他费 等不同列名，以及 证券买入/证券卖出 方向写法。",
+		"2. 同一批交易请只用一个入口导出，不要既导「成交明细」又导「交割单」，否则会被当作两批记录重复入库。",
+		"3. 手工填写：切换到「交易记录」工作表，在示例行下方追加数据，示例行可删除。",
+		"4. 「操作」只填 买入 或 卖出；「市场名称」影响代码前缀识别（上海Ａ股/深圳Ａ股/北京Ａ股/港股）。",
+		"5. 「证券代码」请以文本格式填写，避免前导零丢失（如 000001）。",
+		"6. 费用列（手续费/佣金、印花税、过户费、其他费/其他杂费）可留空（留空按 0 处理）。",
+		"7. 重复记录（代码+方向+时间+价格+数量一致）导入时自动跳过。",
+	}
+	for i, line := range instructions {
+		cell, _ := excelize.CoordinatesToCellName(1, i+1)
+		if err := f.SetCellValue(instrSheet, cell, line); err != nil {
+			return nil, err
+		}
+	}
+	// 标题加粗
+	titleStyle, err := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true, Size: 14}})
+	if err != nil {
+		return nil, err
+	}
+	if err := f.SetCellStyle(instrSheet, "A1", "A1", titleStyle); err != nil {
+		return nil, err
+	}
+
+	// Sheet 2：交易记录（表头 + 示例）
+	dataSheet := "交易记录"
+	if _, err := f.NewSheet(dataSheet); err != nil {
+		return nil, err
+	}
+	for col, name := range tradingRecordTemplateHeader {
+		cell, _ := excelize.CoordinatesToCellName(col+1, 1)
+		if err := f.SetCellValue(dataSheet, cell, name); err != nil {
+			return nil, err
+		}
+	}
+	for r, example := range tradingRecordTemplateExamples {
+		for col, v := range example {
+			cell, _ := excelize.CoordinatesToCellName(col+1, r+2)
+			if err := f.SetCellValue(dataSheet, cell, v); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// 表头样式：加粗 + 灰底 + 居中
+	headerStyle, err := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true},
+		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"D9D9D9"}},
+		Alignment: &excelize.Alignment{Horizontal: "center"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := f.SetCellStyle(dataSheet, "A1", "K1", headerStyle); err != nil {
+		return nil, err
+	}
+	// 列宽
+	widths := []float64{12, 10, 10, 12, 10, 8, 10, 10, 8, 8, 8}
+	for col, w := range widths {
+		name, _ := excelize.ColumnNumberToName(col + 1)
+		if err := f.SetColWidth(dataSheet, name, name, w); err != nil {
+			return nil, err
+		}
+	}
+
+	buf, err := f.WriteToBuffer()
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// tradingRecordDedupKey 构造交易记录去重键（股票代码|方向|交易时间|价格|数量）
+func tradingRecordDedupKey(stockCode, direction string, t time.Time, price float64, volume int64) string {
+	return fmt.Sprintf("%s|%s|%s|%.4f|%d", stockCode, direction, t.In(time.Local).Format("2006-01-02 15:04:05"), price, volume)
 }
 
 // CheckFrequentTrading 检查是否频繁交易

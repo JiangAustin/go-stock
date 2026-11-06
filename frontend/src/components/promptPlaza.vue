@@ -1,18 +1,20 @@
 <script setup>
 import {computed, h, onBeforeMount, onMounted, ref, reactive} from 'vue'
-import {GetConfig, GetSponsorInfo, GetMachineId, CheckDeviceBinding, QuitApp, GetEffectiveSponsorVip, AddPromptTemplate} from "../../wailsjs/go/main/App";
+import {GetConfig, GetSponsorInfo, GetMachineId, CheckDeviceBinding, QuitApp, GetEffectiveSponsorVip, AddPromptTemplate, PromptPlazaRequest} from "../../wailsjs/go/main/App";
 import {useMessage, useDialog} from "naive-ui";
 import {MdPreview, MdEditor} from 'md-editor-v3'
 import 'md-editor-v3/lib/preview.css'
 import 'md-editor-v3/lib/style.css'
 import {EventsEmit} from '../../wailsjs/runtime'
+import PlazaAuthModal from './plazaAuthModal.vue'
+import PlazaBindEmailModal from './plazaBindEmailModal.vue'
 
 const message = useMessage()
 const dialog = useDialog()
 
 const darkTheme = ref(false)
 const editorTheme = ref('light')
-const apiBase = ref('http://go-stock.sparkmemory.top:1918/api')
+const apiBase = ref('') // 由后端配置下发，不写死域名；为空时后端按默认地址处理
 const token = ref(localStorage.getItem('promptPlazaToken') || '')
 const currentUser = ref(null)
 const categories = ref([])
@@ -43,10 +45,11 @@ const detailModal = reactive({
 
 const loginModal = reactive({
   show: false,
-  tab: 'login',
-  username: localStorage.getItem('promptPlazaUsername') || '',
-  password: localStorage.getItem('promptPlazaPassword') || '',
-  nickname: ''
+  tab: 'login'
+})
+
+const bindEmailModal = reactive({
+  show: false
 })
 
 const createModal = reactive({
@@ -106,65 +109,40 @@ onMounted(() => {
   }
 })
 
-function getHeaders() {
-  const headers = {'Content-Type': 'application/json'}
-  if (token.value) {
-    headers['Authorization'] = `Bearer ${token.value}`
-  }
-  return headers
-}
-
 async function apiGet(path, params = {}) {
-  const url = new URL(apiBase.value + path)
-  Object.entries(params).forEach(([k, v]) => {
-    if (v !== null && v !== undefined && v !== '') {
-      url.searchParams.set(k, v)
-    }
-  })
-  const resp = await fetch(url.toString(), {headers: getHeaders()})
-  const json = await resp.json()
-  if (json.code !== 0) {
-    throw new Error(json.message || '请求失败')
+  // 通过 Go 后端代理发起请求，规避 macOS WKWebView 的 ATS 对明文 HTTP 的限制
+  const resp = await PromptPlazaRequest('GET', apiBase.value, path, params, '', token.value)
+  if (resp.code !== 0) {
+    throw new Error(resp.message || '请求失败')
   }
-  return json.data
+  return resp.data
 }
 
 async function apiPost(path, body = null) {
-  const resp = await fetch(apiBase.value + path, {
-    method: 'POST',
-    headers: getHeaders(),
-    body: body ? JSON.stringify(body) : null
-  })
-  const json = await resp.json()
-  if (json.code !== 0) {
-    throw new Error(json.message || '请求失败')
+  // 通过 Go 后端代理发起请求，规避 macOS WKWebView 的 ATS 对明文 HTTP 的限制
+  const resp = await PromptPlazaRequest('POST', apiBase.value, path, null, body ? JSON.stringify(body) : '', token.value)
+  if (resp.code !== 0) {
+    throw new Error(resp.message || '请求失败')
   }
-  return json.data
+  return resp.data
 }
 
 async function apiPut(path, body) {
-  const resp = await fetch(apiBase.value + path, {
-    method: 'PUT',
-    headers: getHeaders(),
-    body: JSON.stringify(body)
-  })
-  const json = await resp.json()
-  if (json.code !== 0) {
-    throw new Error(json.message || '请求失败')
+  // 通过 Go 后端代理发起请求，规避 macOS WKWebView 的 ATS 对明文 HTTP 的限制
+  const resp = await PromptPlazaRequest('PUT', apiBase.value, path, null, JSON.stringify(body), token.value)
+  if (resp.code !== 0) {
+    throw new Error(resp.message || '请求失败')
   }
-  return json.data
+  return resp.data
 }
 
 async function apiDelete(path) {
-  const resp = await fetch(apiBase.value + path, {
-    method: 'DELETE',
-    headers: getHeaders()
-  })
-  const json = await resp.json()
-  if (json.code !== 0) {
-    throw new Error(json.message || '请求失败')
+  // 通过 Go 后端代理发起请求，规避 macOS WKWebView 的 ATS 对明文 HTTP 的限制
+  const resp = await PromptPlazaRequest('DELETE', apiBase.value, path, null, '', token.value)
+  if (resp.code !== 0) {
+    throw new Error(resp.message || '请求失败')
   }
-  return json.data
+  return resp.data
 }
 
 async function loadCategories() {
@@ -198,6 +176,12 @@ async function loadPrompts() {
   }
 }
 
+// 仅当服务端明确表示凭证失效时才清除登录态；网络异常、服务不可用等临时故障不能清 token。
+function isAuthError(e) {
+  const msg = String((e && e.message) || '')
+  return /(^|\D)(401|403)(\D|$)|未登录|请先登录|登录已过期|登录状态.*(失效|无效)|(token|令牌|凭证).*(无效|失效|过期|非法)/i.test(msg)
+}
+
 async function fetchCurrentUser() {
   try {
     const data = await apiGet('/user/me')
@@ -205,9 +189,11 @@ async function fetchCurrentUser() {
     syncVipInfo()
     checkDeviceLimit()
   } catch (e) {
-    token.value = ''
-    localStorage.removeItem('promptPlazaToken')
     currentUser.value = null
+    if (isAuthError(e)) {
+      token.value = ''
+      localStorage.removeItem('promptPlazaToken')
+    }
   }
 }
 
@@ -259,6 +245,9 @@ async function checkDeviceLimit() {
 
 async function syncVipInfo() {
   if (!token.value) return
+  // body 必须声明在 try 之外：catch 里要读 body.sponsorCode 决定是否提示，
+  // 若在 try 内用 const 声明，catch 读取时会抛 ReferenceError，真实失败原因（如赞助码已被其他账号使用）被彻底吞掉
+  let body = null
   try {
     const sponsorInfo = await GetSponsorInfo()
     const vipLevel = sponsorInfo?.vipLevel ? Number(sponsorInfo.vipLevel) : 0
@@ -269,7 +258,7 @@ async function syncVipInfo() {
     } catch (e) {
       console.warn('获取机器ID失败', e)
     }
-    const body = {vipLevel, uuid}
+    body = {vipLevel, uuid}
     if (vipLevel > 0 && vipExpireAt) {
       const d = new Date(vipExpireAt.replace(' ', 'T'))
       body.vipExpireAt = d.toISOString()
@@ -285,60 +274,37 @@ async function syncVipInfo() {
       console.warn('获取赞助码失败', e)
     }
     await apiPost('/user/vip', body)
+    // 服务端权威校验赞助码后返回实际 VIP 状态（客户端提交的 vipLevel 仅作参考，服务端不信任）
     if (currentUser.value) {
-      currentUser.value.vipLevel = vipLevel
-      currentUser.value.vipExpireAt = vipExpireAt
+      const me = await apiGet('/user/me')
+      currentUser.value.vipLevel = me.vipLevel
+      currentUser.value.vipExpireAt = me.vipExpireAt
     }
   } catch (e) {
     console.warn('同步VIP信息失败', e)
+    // 不再静默吞错：VIP 用户看不到失败原因（如赞助码被其他账号使用/验证失败），
+    // 会误以为"本地是VIP但广场权益丢失"，必须明确提示
+    if (body?.sponsorCode) {
+      message.warning('VIP权益同步失败：' + (e.message || '网络异常，请稍后重试'))
+    }
   }
 }
 
-async function handleLogin() {
-  try {
-    const data = await apiPost('/auth/login', {
-      username: loginModal.username,
-      password: loginModal.password
-    })
-    token.value = data.token
-    localStorage.setItem('promptPlazaToken', data.token)
-    localStorage.setItem('promptPlazaUsername', loginModal.username)
-    localStorage.setItem('promptPlazaPassword', loginModal.password)
-    currentUser.value = data.user
-    loginModal.show = false
-    vipRequireLogin.value = false
-    message.success('登录成功')
-    syncVipInfo()
-    checkDeviceLimit()
-    loadPrompts()
-  } catch (e) {
-    message.error('登录失败: ' + e.message)
-  }
+// 登录/注册成功（共享账号弹窗回调）：token 持久化已在弹窗内完成
+async function onPlazaLoggedIn(data) {
+  token.value = data.token
+  currentUser.value = data.user
+  vipRequireLogin.value = false
+  // 登录/注册响应可能不含 email（旧版服务端），拉取完整资料驱动"绑定邮箱"入口显隐
+  // （内部会 syncVipInfo + checkDeviceLimit）
+  fetchCurrentUser()
+  loadPrompts()
 }
 
-async function handleRegister() {
-  try {
-    const data = await apiPost('/auth/register', {
-      username: loginModal.username,
-      password: loginModal.password,
-      nickname: loginModal.nickname
-    })
-    token.value = data.token
-    localStorage.setItem('promptPlazaToken', data.token)
-    localStorage.setItem('promptPlazaUsername', loginModal.username)
-    localStorage.setItem('promptPlazaPassword', loginModal.password)
-    currentUser.value = data.user
-    loginModal.show = false
-    vipRequireLogin.value = false
-    loginModal.username = ''
-    loginModal.password = ''
-    loginModal.nickname = ''
-    message.success('注册成功')
-    syncVipInfo()
-    checkDeviceLimit()
-    loadPrompts()
-  } catch (e) {
-    message.error('注册失败: ' + e.message)
+// 绑定邮箱成功（共享绑定弹窗回调）
+function onEmailBound({email}) {
+  if (currentUser.value) {
+    currentUser.value.email = email
   }
 }
 
@@ -710,6 +676,9 @@ function timeAgo(timeStr) {
               {{ currentUser?.nickname || currentUser?.username || '已登录' }}
               <template v-if="currentUser?.vipLevel >= 1"> · VIP{{ currentUser.vipLevel }}</template>
             </n-tag>
+            <n-tag v-if="!currentUser?.email" size="small" type="warning" round style="cursor: pointer" title="绑定邮箱后可通过邮箱找回密码" @click="bindEmailModal.show = true">
+              📧 绑定邮箱
+            </n-tag>
             <n-button size="small" quaternary @click="handleLogout">退出</n-button>
           </template>
           <template v-else>
@@ -946,36 +915,23 @@ function timeAgo(timeStr) {
       </template>
     </n-modal>
 
-    <n-modal v-model:show="loginModal.show" preset="card" style="width: 400px" :title="vipRequireLogin ? '🎉 VIP专属福利' : '账号'" :closable="!vipRequireLogin" :maskClosable="!vipRequireLogin" :closeOnEsc="!vipRequireLogin">
-      <div v-if="vipRequireLogin" style="margin-bottom: 16px; padding: 12px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 8px; color: #fff">
-        <div style="font-size: 15px; font-weight: 600; margin-bottom: 8px">✨ 欢迎回来，VIP用户！</div>
-        <div style="font-size: 13px; line-height: 1.6; opacity: 0.95">
-          登录后即可解锁专属权益：
-          <div style="margin-top: 6px; padding-left: 8px">
-            📖 查看 <b>VIP专属提示词</b>，获取更精准的分析策略<br/>
-            🔒 自动绑定当前设备，保障账号安全<br/>
-            💡 与社区用户共享投资灵感
-          </div>
-        </div>
-      </div>
-      <n-tabs v-model:value="loginModal.tab" type="line">
-        <n-tab-pane name="login" tab="登录">
-          <n-space vertical :size="12">
-            <n-input v-model:value="loginModal.username" placeholder="用户名" />
-            <n-input v-model:value="loginModal.password" type="password" placeholder="密码" show-password-on="click" />
-            <n-button type="primary" block @click="handleLogin">登录</n-button>
-          </n-space>
-        </n-tab-pane>
-        <n-tab-pane name="register" tab="注册">
-          <n-space vertical :size="12">
-            <n-input v-model:value="loginModal.username" placeholder="用户名 (3-50字)" />
-            <n-input v-model:value="loginModal.password" type="password" placeholder="密码 (6字以上)" show-password-on="click" />
-            <n-input v-model:value="loginModal.nickname" placeholder="昵称 (可选)" />
-            <n-button type="primary" block @click="handleRegister">注册</n-button>
-          </n-space>
-        </n-tab-pane>
-      </n-tabs>
-    </n-modal>
+    <!-- 登录/注册/忘记密码（共享组件） -->
+    <PlazaAuthModal
+      v-model:show="loginModal.show"
+      v-model:tab="loginModal.tab"
+      :api-base="apiBase"
+      :vip-require-login="vipRequireLogin"
+      @logged-in="onPlazaLoggedIn"
+    />
+
+    <!-- 绑定邮箱（共享组件，未绑定邮箱的旧账号） -->
+    <PlazaBindEmailModal
+      v-model:show="bindEmailModal.show"
+      :api-base="apiBase"
+      :token="token"
+      :username="currentUser?.username || ''"
+      @bound="onEmailBound"
+    />
 
     <n-modal v-model:show="createModal.show" preset="card" style="width: 1100px; max-width: 95vw" title="发布提示词">
       <n-space vertical :size="12">

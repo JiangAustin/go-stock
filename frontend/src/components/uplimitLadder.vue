@@ -1,8 +1,9 @@
 <script setup>
-import {onBeforeMount, onBeforeUnmount, ref, computed, h} from 'vue'
-import {GetConfig, GetUplimitHot, IsTradingTime, IsTradingDay, GetLatestTradingDay} from "../../wailsjs/go/main/App";
+import {onBeforeMount, onBeforeUnmount, ref, computed, h, watch} from 'vue'
+import {GetConfig, GetUplimitHot, IsTradingTime, IsTradingDay, GetLatestTradingDay, GetStocksRealtimeQuotes} from "../../wailsjs/go/main/App";
 import {NButton, NText, NTag, NTooltip, NProgress, useMessage} from "naive-ui";
 import StockLightweightKlineChart from "./StockLightweightKlineChart.vue";
+import { KLINE_MODAL_CONTENT_STYLE, KLINE_MODAL_STYLE, useKlineModalFit } from "./kline/useKlineModalFit";
 
 const message = useMessage()
 const loading = ref(false)
@@ -12,9 +13,88 @@ const showPlateModal = ref(false)
 const showKlineModal = ref(false)
 const klineCode = ref('')
 const klineName = ref('')
+// K 线弹窗尺寸与图表高度自适应：与全站其他 K 线弹窗统一
+const klineWrapRef = ref(null)
+const { chartHeight: klineChartHeight, attach: attachKlineFit, detach: detachKlineFit } = useKlineModalFit(klineWrapRef)
+watch(showKlineModal, (v) => {
+  if (v) {
+    attachKlineFit()
+    return
+  }
+  detachKlineFit()
+})
 const activeView = ref('ladder')
 const expandedLadders = ref([])
 const darkTheme = ref(false)
+
+// ===== 最新价/涨跌幅：随涨停梯队数据批量拉取实时行情 =====
+const quoteMap = ref({})
+
+/** 行情代码归一：去掉 sh/sz/bj 前缀，与涨停数据里的 6 位纯代码对齐 */
+function quoteKey(code) {
+  return String(code || '').toLowerCase().replace(/^(sh|sz|bj)(?=\d)/, '')
+}
+
+/** 6 位纯代码补行情前缀：92 开头为北交所新代码段，5/6/9 沪市，0-3 深市，4/8 北交所 */
+function toQuoteCode(code) {
+  const c = String(code || '').trim()
+  if (!/^\d{6}$/.test(c)) return c
+  if (/^92/.test(c) || /^[48]/.test(c)) return 'bj' + c
+  if (/^[569]/.test(c)) return 'sh' + c
+  if (/^[0123]/.test(c)) return 'sz' + c
+  return c
+}
+
+/** 汇总页面各视图涉及的股票代码，一次性批量拉实时行情（失败静默，不打断梯队展示） */
+function refreshQuotes() {
+  const codes = new Set()
+  for (const stocks of Object.values(rawData.value?.plate_stocks || {})) {
+    for (const s of stocks || []) codes.add(String(s.stock_code || ''))
+  }
+  for (const stocks of Object.values(rawData.value?.plate_stocks_zb || {})) {
+    for (const s of stocks || []) codes.add(String(s.stock_code || ''))
+  }
+  for (const code of Object.keys(rawData.value?.stocks_hot || {})) codes.add(String(code))
+  const list = [...codes].filter(Boolean).map(toQuoteCode)
+  if (!list.length) {
+    quoteMap.value = {}
+    return
+  }
+  GetStocksRealtimeQuotes(list).then(quotes => {
+    const map = {}
+    for (const q of quotes || []) map[quoteKey(q.code)] = q
+    quoteMap.value = map
+  }).catch(() => {})
+}
+
+watch(rawData, () => refreshQuotes())
+
+/** 最新价，无行情时显示 -- */
+function fmtQuotePrice(code) {
+  const q = quoteMap.value[quoteKey(code)]
+  if (!q || !q.price) return '--'
+  return Number(q.price).toFixed(2)
+}
+
+/** 涨跌幅（带正负号），无行情时显示 -- */
+function fmtQuoteChangePct(code) {
+  const q = quoteMap.value[quoteKey(code)]
+  if (!q) return '--'
+  const v = Number(q.changePercent)
+  if (Number.isNaN(v)) return '--'
+  return (v > 0 ? '+' : '') + v.toFixed(2) + '%'
+}
+
+/** 涨跌幅颜色：涨红跌绿，无行情用默认色 */
+function quoteChangeColor(code) {
+  const q = quoteMap.value[quoteKey(code)]
+  if (!q) return ''
+  const v = Number(q.changePercent)
+  if (Number.isNaN(v)) return ''
+  if (v > 0) return '#e03030'
+  if (v < 0) return '#18a058'
+  return ''
+}
 
 function getCalendarTodayStr() {
   const t = new Date()
@@ -335,6 +415,8 @@ const plateTableMaxHeight = computed(() => Math.max(300, window.innerHeight * 0.
 const plateStockColumns = [
   {title: '代码', key: 'stock_code', width: 90, render: (row) => h(NText, {depth: 3, style: 'font-size:12px'}, () => row.stock_code)},
   {title: '名称', key: 'stock_name', width: 80, render: (row) => h(NText, {strong: true, style: 'cursor:pointer;color:#2080f0;text-decoration:underline;', onClick: () => showKline(row.stock_code, row.stock_name)}, () => row.stock_name)},
+  {title: '最新价', key: 'quote_price', width: 70, render: (row) => h(NText, {style: 'font-size:12px;font-weight:bold;color:' + quoteChangeColor(row.stock_code)}, () => fmtQuotePrice(row.stock_code))},
+  {title: '涨跌幅', key: 'quote_change_pct', width: 70, render: (row) => h(NText, {style: 'font-size:12px;font-weight:bold;color:' + quoteChangeColor(row.stock_code)}, () => fmtQuoteChangePct(row.stock_code))},
   {title: '类型', key: 'up_limit_type', width: 70, render: (row) => h(NTag, {color: {color: getTypeColor(row.up_limit_type), textColor: '#fff'}, size: 'tiny', round: true}, () => getTypeLabel(row.up_limit_type))},
   {title: '描述', key: 'up_limit_desc', width: 70, render: (row) => row.up_limit_desc ? h(NTag, {size: 'tiny', type: row.up_limit_keep_times >= 3 ? 'error' : 'default', round: true}, () => row.up_limit_desc) : ''},
   {title: '时间', key: 'up_limit_time', width: 70, render: (row) => h(NText, {depth: 3, style: 'font-size:12px'}, () => row.up_limit_time || '')},
@@ -352,12 +434,14 @@ function selectPlate(code) {
 function toEastMoneyCode(code) {
   if (!code) return ''
   const c = String(code).trim()
-  if (/\.(SH|SZ|BJ|HK|SS)$/i.test(c)) return c.toUpperCase()
+  if (/\.(SH|SZ|BJ|HK|US|SS)$/i.test(c)) return c.toUpperCase()
   const lower = c.toLowerCase()
   if (lower.startsWith('sh')) return lower.slice(2) + '.SH'
   if (lower.startsWith('sz')) return lower.slice(2) + '.SZ'
   if (lower.startsWith('bj')) return lower.slice(2) + '.BJ'
   if (lower.startsWith('hk')) return lower.slice(2).toUpperCase() + '.HK'
+  if (lower.startsWith('us')) return lower.slice(2).toUpperCase() + '.US'
+  if (lower.startsWith('gb_')) return lower.slice(3).toUpperCase() + '.US'
   if (/^\d+$/.test(c)) {
     const d = c[0]
     if (d === '6') return c + '.SH'
@@ -365,7 +449,9 @@ function toEastMoneyCode(code) {
     if (d === '8' || d === '9') return c + '.BJ'
     return c + '.SZ'
   }
-  return c.toUpperCase()
+  // 纯字母代码视为美股（如 AAPL → AAPL.US）
+  if (/^[a-zA-Z]+$/.test(c)) return c.toUpperCase() + '.US'
+  return ''
 }
 
 function showKline(code, name) {
@@ -434,6 +520,14 @@ function showKline(code, name) {
                       <n-text depth="3" style="font-size:12px;">{{ stock.up_limit_time }}</n-text>
                     </n-space>
                     <n-space align="center" :size="12" wrap>
+                      <n-space align="center" :size="4">
+                        <n-text depth="3" style="font-size:11px;">最新价</n-text>
+                        <n-text :style="'font-weight:bold;font-size:13px;color:' + quoteChangeColor(stock.stock_code)">{{ fmtQuotePrice(stock.stock_code) }}</n-text>
+                      </n-space>
+                      <n-space align="center" :size="4">
+                        <n-text depth="3" style="font-size:11px;">涨跌幅</n-text>
+                        <n-text :style="'font-weight:bold;font-size:13px;color:' + quoteChangeColor(stock.stock_code)">{{ fmtQuoteChangePct(stock.stock_code) }}</n-text>
+                      </n-space>
                       <n-space align="center" :size="4">
                         <n-text depth="3" style="font-size:11px;">封单</n-text>
                         <n-text :style="'color:'+getFdCloseColor(stock.fd_close)+';font-weight:bold;font-size:13px;'">{{ stock.fd_close }}%</n-text>
@@ -520,6 +614,8 @@ function showKline(code, name) {
                   <n-th width="50px">排名</n-th>
                   <n-th>代码</n-th>
                   <n-th>名称</n-th>
+                  <n-th>最新价</n-th>
+                  <n-th>涨跌幅</n-th>
                   <n-th>热度</n-th>
                   <n-th>概念板块</n-th>
                 </n-tr>
@@ -532,6 +628,8 @@ function showKline(code, name) {
                   </n-td>
                   <n-td><n-text strong>{{ item.code }}</n-text></n-td>
                   <n-td><n-text strong style="cursor:pointer;color:#2080f0;text-decoration:underline;" @click="showKline(item.code, item.name)">{{ item.name }}</n-text></n-td>
+                  <n-td><n-text :style="'font-weight:bold;color:' + quoteChangeColor(item.code)">{{ fmtQuotePrice(item.code) }}</n-text></n-td>
+                  <n-td><n-text :style="'font-weight:bold;color:' + quoteChangeColor(item.code)">{{ fmtQuoteChangePct(item.code) }}</n-text></n-td>
                   <n-td>
                     <n-space align="center" :size="4">
                       <n-progress
@@ -569,6 +667,8 @@ function showKline(code, name) {
                 <n-tr>
                   <n-th>代码</n-th>
                   <n-th>名称</n-th>
+                  <n-th>最新价</n-th>
+                  <n-th>涨跌幅</n-th>
                   <n-th>时间</n-th>
                   <n-th>最高封单</n-th>
                   <n-th>成交额</n-th>
@@ -580,6 +680,8 @@ function showKline(code, name) {
                 <n-tr v-for="s in explodedStocks" :key="s.stock_code + s.plate_code">
                   <n-td><n-text depth="3" style="font-size:12px;">{{ s.stock_code }}</n-text></n-td>
                   <n-td><n-text type="error" style="cursor:pointer;text-decoration:underline;" @click="showKline(s.stock_code, s.stock_name)">{{ s.stock_name }}</n-text></n-td>
+                  <n-td><n-text :style="'font-size:12px;font-weight:bold;color:' + quoteChangeColor(s.stock_code)">{{ fmtQuotePrice(s.stock_code) }}</n-text></n-td>
+                  <n-td><n-text :style="'font-size:12px;font-weight:bold;color:' + quoteChangeColor(s.stock_code)">{{ fmtQuoteChangePct(s.stock_code) }}</n-text></n-td>
                   <n-td><n-text depth="3" style="font-size:12px;">{{ s.up_limit_time }}</n-text></n-td>
                   <n-td><n-text style="font-size:12px;">{{ s.fd_max }}%</n-text></n-td>
                   <n-td><n-text style="font-size:12px;">{{ s.amount }}亿</n-text></n-td>
@@ -610,16 +712,19 @@ function showKline(code, name) {
 
     <n-modal v-model:show="showKlineModal" preset="card"
       :title="(klineName || '') + ' — 多周期K线'"
-      style="width: 95vw; max-width: 1200px;"
+      :style="KLINE_MODAL_STYLE"
+      :content-style="KLINE_MODAL_CONTENT_STYLE"
       :bordered="true">
-      <stock-lightweight-kline-chart
-        v-if="showKlineModal"
-        :dark-theme="darkTheme"
-        :key="'kline-' + klineCode"
-        :code="klineCode"
-        :stock-name="klineName"
-        :chart-height="500"
-      />
+      <div ref="klineWrapRef">
+        <stock-lightweight-kline-chart
+          v-if="showKlineModal"
+          :dark-theme="darkTheme"
+          :key="'kline-' + klineCode"
+          :code="klineCode"
+          :stock-name="klineName"
+          :chart-height="klineChartHeight"
+        />
+      </div>
     </n-modal>
   </div>
 </template>
